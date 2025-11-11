@@ -74,4 +74,5 @@ helm install rancher rancher-latest/rancher \
   --set ingress.tls.source=letsEncrypt \
   --set letsEncrypt.email=<any/your email address> \
   --set letsEncrypt.ingress.class=traefik \
+  --set agentTLSMode=system-store
   --devel

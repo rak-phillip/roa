@@ -1,0 +1,77 @@
+#!/bin/bash
+set -e
+
+# Update and install dependencies
+sudo apt-get update -y
+sudo apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    uidmap
+
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker ubuntu 
+sudo systemctl enable docker
+sudo systemctl start docker
+
+# Install k3d
+wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+# Install Helm
+curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+sudo apt-get update
+sudo apt-get install helm
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# Verify installations
+docker --version
+k3d version
+kubectl version --client
+helm version
+
+# Create a default k3d cluster
+k3d cluster create rancher-dev -p 80:80@loadbalancer -p 443:443@loadbalancer
+
+# Create .kube/config for user
+mkdir /home/ubuntu/.kube
+k3d kubeconfig get rancher-dev > /home/ubuntu/.kube/config
+
+# Get public IP of ec2 instance
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+export PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+echo $PUBLIC_IP
+
+# Install Rancher
+helm repo add jetstack https://charts.jetstack.io
+
+helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
+
+kubectl create namespace cert-manager
+
+kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v1.16.3/cert-manager.crds.yaml
+
+helm repo add jetstack https://charts.jetstack.io
+
+helm repo update
+
+helm install cert-manager jetstack/cert-manager --namespace cert-manager --version v1.16.3
+
+kubectl create namespace cattle-system
+
+helm install rancher rancher-latest/rancher \
+  --namespace cattle-system \
+  --set hostname=${PUBLIC_IP}.sslip.io \
+  --set ingress.tls.source=letsEncrypt \
+  --set letsEncrypt.email=<any/your email address> \
+  --set letsEncrypt.ingress.class=traefik \
+  --devel

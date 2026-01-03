@@ -14,7 +14,7 @@ sudo apt-get install -y \
 # Install Docker
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
-sudo usermod -aG docker ubuntu 
+sudo usermod -aG docker ubuntu
 sudo systemctl enable docker
 sudo systemctl start docker
 
@@ -74,5 +74,5 @@ helm install rancher rancher-latest/rancher \
   --set ingress.tls.source=letsEncrypt \
   --set letsEncrypt.email=<any/your email address> \
   --set letsEncrypt.ingress.class=traefik \
-  --set agentTLSMode=system-store
+  --set agentTLSMode=system-store \
   --devel

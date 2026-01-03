@@ -8,3 +8,4 @@ aws-config = { version = "1.8.12", features = ["credentials-login"] }
 aws-sdk-ec2 = "1.199.0"
 clap = { version = "4.5.53", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
+base64 = "0.22.1"

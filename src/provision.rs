@@ -1,19 +1,24 @@
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_ec2::Client;
+use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser, Subcommand};
+use base64::{engine::general_purpose, Engine};
 
 #[derive(Parser, Debug)]
 #[command(name = "roa", about = "Rancher on AWS", long_about = None)]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    pub command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
-enum Commands{
+pub enum Commands{
     Provision(ProvisionArgs),
 }
 
 #[derive(Parser, Debug)]
-struct ProvisionArgs {
+pub struct ProvisionArgs {
     #[arg(long = "name")]
     name: String,
 
@@ -28,5 +33,72 @@ struct ProvisionArgs {
 
     #[arg(long)]
     key_name: String,
+
+    #[arg(long)]
+    security_group_id: String,
 }
 
+pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let user_data_script = include_str!("../user-data");
+    let user_data = general_purpose::STANDARD.encode(user_data_script);
+
+    let ami_id = "ami-00f46ccd1cbfb363e";
+
+    let block_device = BlockDeviceMapping::builder()
+        .device_name("/dev/xvda")
+        .ebs(
+            EbsBlockDevice::builder()
+                .volume_size(args.storage_gb)
+                .volume_type(aws_sdk_ec2::types::VolumeType::Gp3)
+                .delete_on_termination(true)
+                .build()
+        )
+        .build();
+
+    let name_tag = Tag::builder()
+        .key("Name")
+        .value(args.name.clone())
+        .build();
+
+    let tag_spec = TagSpecification::builder()
+        .resource_type(aws_sdk_ec2::types::ResourceType::Instance)
+        .tags(name_tag)
+        .build();
+
+    let network_interface = InstanceNetworkInterfaceSpecification::builder()
+        .associate_public_ip_address(true)
+        .subnet_id(args.subnet_id.clone())
+        .groups(args.security_group_id.clone())
+        .device_index(0)
+        .build();
+
+    let resp = client
+        .run_instances()
+        .image_id(ami_id)
+        .instance_type(InstanceType::T32xlarge)
+        .min_count(1)
+        .max_count(1)
+        .key_name(args.key_name.clone())
+        .user_data(user_data)
+        .network_interfaces(network_interface)
+        .block_device_mappings(block_device)
+        .tag_specifications(tag_spec)
+        .send()
+        .await?;
+
+    let instance_id = resp.instances()
+        .first()
+        .and_then(|instance| instance.instance_id())
+        .unwrap_or("<unknown>");
+
+    println!("Launched instance: {}", instance_id);
+
+    Ok(())
+}

@@ -1,21 +1,17 @@
 mod provision;
 
 use clap::Parser;
+use crate::provision::{Cli, Commands, provision};
 
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    name: String,
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
 
-    #[arg(short, long, default_value_t = 1)]
-    count: u8,
-}
-
-fn main() {
-    let args = Args::parse();
-
-    for _ in 0..args.count {
-        println!("Hello {}!", args.name);
+    match cli.command {
+        Commands::Provision(args) => {
+            provision(args).await?;
+        }
     }
+
+    Ok(())
 }

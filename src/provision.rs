@@ -50,7 +50,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
     let client = Client::new(&config);
 
     let user_data_script = include_str!("../user-data")
-        .replace("<LETS_ENCRYPT_EMAIL", &args.email);
+        .replace("<LETS_ENCRYPT_EMAIL>", &args.email);
     let user_data = general_purpose::STANDARD.encode(user_data_script);
 
     let ami_id = "ami-00f46ccd1cbfb363e";

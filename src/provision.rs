@@ -56,7 +56,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
     let ami_id = "ami-00f46ccd1cbfb363e";
 
     let block_device = BlockDeviceMapping::builder()
-        .device_name("/dev/xvda")
+        .device_name("/dev/sda1")
         .ebs(
             EbsBlockDevice::builder()
                 .volume_size(args.storage_gb)

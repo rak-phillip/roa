@@ -72,7 +72,7 @@ helm install rancher rancher-latest/rancher \
   --namespace cattle-system \
   --set hostname=${PUBLIC_IP}.sslip.io \
   --set ingress.tls.source=letsEncrypt \
-  --set letsEncrypt.email=<any/your email address> \
+  --set letsEncrypt.email="<LETS_ENCRYPT_EMAIL>" \
   --set letsEncrypt.ingress.class=traefik \
   --set agentTLSMode=system-store \
   --devel

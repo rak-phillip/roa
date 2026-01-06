@@ -25,16 +25,16 @@ pub struct ProvisionArgs {
     #[arg(long, default_value_t = 64)]
     storage_gb: i32,
 
-    #[arg(long)]
+    #[arg(long, env = "ROA_VPC_ID")]
     vpc_id: String,
 
-    #[arg(long)]
+    #[arg(long, env = "ROA_SUBNET_ID")]
     subnet_id: String,
 
     #[arg(long)]
     key_name: String,
 
-    #[arg(long)]
+    #[arg(long, env = "ROA_SECURITY_GROUP_ID")]
     security_group_id: String,
 
     #[arg(long)]

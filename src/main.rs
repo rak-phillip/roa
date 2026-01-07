@@ -1,7 +1,22 @@
 mod provision;
+mod terminate;
 
-use clap::Parser;
-use crate::provision::{Cli, Commands, provision};
+use clap::{Parser, Subcommand};
+use crate::provision::{provision, ProvisionArgs};
+use crate::terminate::{terminate, TerminateArgs};
+
+#[derive(Parser, Debug)]
+#[command(name = "roa", about = "Rancher on AWS", long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands{
+    Provision(ProvisionArgs),
+    Terminate(TerminateArgs),
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,12 +25,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         dotenvy::from_path(config_path).ok();
     }
-    
+
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Provision(args) => {
             provision(args).await?;
+        },
+        Commands::Terminate(args) => {
+            terminate(args).await?;
         }
     }
 

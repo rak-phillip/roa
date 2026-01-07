@@ -2,20 +2,9 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
-use clap::{Parser, Subcommand};
+use clap::{Parser};
 use base64::{engine::general_purpose, Engine};
 
-#[derive(Parser, Debug)]
-#[command(name = "roa", about = "Rancher on AWS", long_about = None)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Commands{
-    Provision(ProvisionArgs),
-}
 
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {

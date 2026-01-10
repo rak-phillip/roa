@@ -1,5 +1,6 @@
 mod provision;
 mod terminate;
+mod network;
 
 use clap::{Parser, Subcommand};
 use crate::provision::{provision, ProvisionArgs};

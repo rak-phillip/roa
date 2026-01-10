@@ -4,7 +4,7 @@ use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser};
 use base64::{engine::general_purpose, Engine};
-
+use crate::network::create_security_group;
 
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {
@@ -24,7 +24,7 @@ pub struct ProvisionArgs {
     key_name: String,
 
     #[arg(long, env = "ROA_SECURITY_GROUP_ID")]
-    security_group_id: String,
+    security_group_id: Option<String>,
 
     #[arg(long)]
     email: String,
@@ -65,10 +65,15 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .tags(name_tag)
         .build();
 
+    let security_group_id = match args.security_group_id {
+        Some(id) => id.into(),
+        None => create_security_group(&client, &args.vpc_id, &args.name).await?,
+    };
+
     let network_interface = InstanceNetworkInterfaceSpecification::builder()
         .associate_public_ip_address(true)
         .subnet_id(args.subnet_id.clone())
-        .groups(args.security_group_id.clone())
+        .groups(security_group_id.clone())
         .device_index(0)
         .build();
 

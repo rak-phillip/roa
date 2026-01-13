@@ -2,9 +2,24 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
-use clap::{Parser};
+use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
 use crate::network::create_security_group;
+
+#[derive(Debug, Clone, ValueEnum)]
+enum RancherRepo {
+    Latest,
+    Prime,
+}
+
+impl RancherRepo {
+    fn value(&self) -> &str {
+        match &self {
+            RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest",
+            RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {
@@ -28,6 +43,12 @@ pub struct ProvisionArgs {
 
     #[arg(long)]
     email: String,
+
+    #[arg(long, default_value_t = RancherRepo::Latest, value_enum)]
+    rancher_repo: RancherRepo,
+
+    #[arg(long)]
+    rancher_version: Option<String>,
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -38,8 +59,20 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .await;
     let client = Client::new(&config);
 
+    let rancher_version = match &args.rancher_version {
+        Some(version) => format!("--version {}", version),
+        None => "--devel".to_string(),
+    };
+
+    let rancher_repo = match &args.rancher_repo {
+        RancherRepo::Latest => RancherRepo::Latest.value(),
+        RancherRepo::Prime => RancherRepo::Prime.value(),
+    };
+
     let user_data_script = include_str!("../user-data")
-        .replace("<LETS_ENCRYPT_EMAIL>", &args.email);
+        .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
+        .replace("\"<RANCHER_REPO>\"", &rancher_repo)
+        .replace("\"<RANCHER_VERSION>\"", &rancher_version);
     let user_data = general_purpose::STANDARD.encode(user_data_script);
 
     let ami_id = "ami-00f46ccd1cbfb363e";

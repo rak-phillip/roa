@@ -21,10 +21,19 @@ impl RancherRepo {
     }
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum ProvisionMode {
+    Helm,
+    Docker,
+}
+
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {
     #[arg(long = "name")]
     name: String,
+
+    #[arg(long, value_enum, default_value_t = ProvisionMode::Helm)]
+    mode: ProvisionMode,
 
     #[arg(long, default_value_t = 64)]
     storage_gb: i32,
@@ -49,6 +58,9 @@ pub struct ProvisionArgs {
 
     #[arg(long)]
     rancher_version: Option<String>,
+
+    #[arg(long, default_value = "rancher/rancher")]
+    docker_registry: String,
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -69,10 +81,21 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         RancherRepo::Prime => RancherRepo::Prime.value(),
     };
 
-    let user_data_script = include_str!("../user-data")
-        .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
-        .replace("\"<RANCHER_REPO>\"", &rancher_repo)
-        .replace("\"<RANCHER_VERSION>\"", &rancher_version);
+    let user_data_script = match args.mode {
+        ProvisionMode::Helm => &*include_str!("../user-data")
+            .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
+            .replace("\"<RANCHER_REPO>\"", &rancher_repo)
+            .replace("\"<RANCHER_VERSION>\"", &rancher_version),
+        ProvisionMode::Docker => {
+            let version = args.rancher_version
+                .as_deref()
+                .unwrap_or("head");
+
+            &*include_str!("../user-data-docker")
+                .replace("\"<DOCKER_REGISTRY>\"", &args.docker_registry)
+                .replace("\"<RANCHER_VERSION>\"", version)
+        },
+    };
     let user_data = general_purpose::STANDARD.encode(user_data_script);
 
     let ami_id = "ami-00f46ccd1cbfb363e";

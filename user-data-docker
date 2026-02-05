@@ -1,0 +1,47 @@
+#!/bin/bash
+set -e
+
+# Update and install dependencies
+sudo apt-get update -y
+sudo apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    uidmap
+
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker ubuntu
+sudo systemctl enable docker
+sudo systemctl start docker
+
+# Install k3d
+wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+# Install Helm
+curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+sudo apt-get update
+sudo apt-get install helm
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# Verify installations
+docker --version
+k3d version
+kubectl version --client
+helm version
+
+# Install Rancher
+sudo docker run -d \
+  --restart=unless-stopped \
+  -p 80:80 \
+  -p 443:443 \
+  -e CATTLE_BOOTSTRAP_PASSWORD=c162ad26-9b17-4aa8-8b8b-c94c9085b353 \
+  --name rancher-"<RANCHER_VERSION>" \
+  --privileged "<DOCKER_REGISTRY>":"<RANCHER_VERSION>"

@@ -10,6 +10,7 @@ use crate::network::create_security_group;
 enum RancherRepo {
     Latest,
     Prime,
+    Alpha,
 }
 
 impl RancherRepo {
@@ -17,6 +18,7 @@ impl RancherRepo {
         match &self {
             RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest",
             RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime",
+            RancherRepo::Alpha => "https://charts.optimus.rancher.io/server-charts/alpha",
         }
     }
 }
@@ -79,6 +81,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
     let rancher_repo = match &args.rancher_repo {
         RancherRepo::Latest => RancherRepo::Latest.value(),
         RancherRepo::Prime => RancherRepo::Prime.value(),
+        RancherRepo::Alpha => RancherRepo::Alpha.value(),
     };
 
     let user_data_script = match args.mode {

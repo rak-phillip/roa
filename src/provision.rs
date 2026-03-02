@@ -4,7 +4,7 @@ use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
-use crate::network::create_security_group;
+use crate::network::{create_security_group, get_public_ip};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum RancherRepo {
@@ -156,6 +156,9 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .unwrap_or("<unknown>");
 
     println!("Launched instance: {}", instance_id);
+
+    let public_ip = get_public_ip(&client, instance_id).await?;
+    println!("Public IP: {}", public_ip);
 
     Ok(())
 }

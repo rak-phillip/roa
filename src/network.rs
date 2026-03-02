@@ -1,5 +1,7 @@
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{IpPermission, IpRange};
+use aws_sdk_route53 as route53;
+use route53::types::{Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -72,4 +74,34 @@ pub async fn get_public_ip(client: &Client, instance_id: &str) -> Result<String,
     }
 
     Err("No public IP found".into())
+}
+
+pub async fn upsert_dns_record(r53: &route53::Client, hosted_zone_id: &str, fqdn: &str, ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resource_record = ResourceRecord::builder()
+        .value(ip)
+        .build();
+
+    let resource_record_set = ResourceRecordSet::builder()
+        .name(fqdn.to_string())
+        .r#type(RrType::A)
+        .ttl(300)
+        .resource_records(resource_record?)
+        .build();
+
+    let change = Change::builder()
+        .action(ChangeAction::Upsert)
+        .resource_record_set(resource_record_set?)
+        .build();
+
+    let batch = ChangeBatch::builder()
+        .changes(change?)
+        .build();
+
+    r53.change_resource_record_sets()
+        .hosted_zone_id(hosted_zone_id)
+        .change_batch(batch?)
+        .send()
+        .await?;
+
+    Ok(())
 }

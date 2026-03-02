@@ -4,7 +4,7 @@ use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
-use crate::network::{create_security_group, get_public_ip};
+use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum RancherRepo {
@@ -52,6 +52,9 @@ pub struct ProvisionArgs {
     #[arg(long, env = "ROA_SECURITY_GROUP_ID")]
     security_group_id: Option<String>,
 
+    #[arg(long, env = "ROA_HOSTED_ZONE_ID")]
+    hosted_zone_id: String,
+
     #[arg(long)]
     email: String,
 
@@ -72,6 +75,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .load()
         .await;
     let client = Client::new(&config);
+    let r53 = aws_sdk_route53::Client::new(&config);
 
     let rancher_version = match &args.rancher_version {
         Some(version) => format!("--version {}", version),
@@ -84,8 +88,11 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         RancherRepo::Alpha => RancherRepo::Alpha.value(),
     };
 
+    let fqdn = format!("{}.ui.rancher.space", args.name);
+
     let user_data_script = match args.mode {
         ProvisionMode::Helm => &*include_str!("../user-data")
+            .replace("\"<RANCHER_HOSTNAME>\"", fqdn.as_str())
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", &rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version),
@@ -159,6 +166,8 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let public_ip = get_public_ip(&client, instance_id).await?;
     println!("Public IP: {}", public_ip);
+
+    upsert_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await?;
 
     Ok(())
 }

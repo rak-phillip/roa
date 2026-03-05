@@ -3,6 +3,7 @@ use aws_sdk_ec2::types::{IpPermission, IpRange};
 use aws_sdk_route53 as route53;
 use route53::types::{Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType};
 use std::time::Duration;
+use aws_sdk_ec2::error::ProvideErrorMetadata;
 use tokio::time::sleep;
 
 pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -54,23 +55,42 @@ pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str) -
 }
 
 pub async fn get_public_ip(client: &Client, instance_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut delay = Duration::from_secs(2);
+
     for _ in 0..30 {
         println!("Getting public IP for {}", instance_id);
 
-        let resp = client.describe_instances()
+        match client
+            .describe_instances()
             .instance_ids(instance_id)
             .send()
-            .await?;
+            .await
+        {
+            Ok(resp) => {
+                if let Some(reservation) = resp.reservations().first() {
+                    if let Some(instance) = reservation.instances().first() {
+                        if let Some(ip) = instance.public_ip_address() {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                }
+            }
 
-        if let Some(reservation) = resp.reservations().first() {
-            if let Some(instance) = reservation.instances().first() {
-                if let Some(ip) = instance.public_ip_address() {
-                    return Ok(ip.to_string());
+            Err(sdk_error) => {
+                if let Some(service_error) = sdk_error.as_service_error() {
+                    if service_error.code() == Some("InvalidInstanceID.NotFound") {
+                        eprintln!("Instance {} not found; retrying...", instance_id);
+                    } else {
+                        return Err(sdk_error.into());
+                    }
+                } else {
+                    return Err(sdk_error.into())
                 }
             }
         }
 
-        sleep(Duration::from_secs(5)).await;
+        sleep(delay).await;
+        delay = std::cmp::min(delay * 2, Duration::from_secs(30));
     }
 
     Err("No public IP found".into())

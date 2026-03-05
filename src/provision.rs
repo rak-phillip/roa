@@ -66,6 +66,9 @@ pub struct ProvisionArgs {
 
     #[arg(long, default_value = "rancher/rancher")]
     docker_registry: String,
+
+    #[arg(long)]
+    rancher_hostname: Option<String>,
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -92,7 +95,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let user_data_script = match args.mode {
         ProvisionMode::Helm => &*include_str!("../user-data")
-            .replace("\"<RANCHER_HOSTNAME>\"", fqdn.as_str())
+            .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", &rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version),

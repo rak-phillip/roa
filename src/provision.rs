@@ -69,6 +69,9 @@ pub struct ProvisionArgs {
 
     #[arg(long)]
     rancher_hostname: Option<String>,
+
+    #[arg(long, env = "ROA_AMI_ID")]
+    ami_id: String,
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -111,8 +114,6 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
     };
     let user_data = general_purpose::STANDARD.encode(user_data_script);
 
-    let ami_id = "ami-00f46ccd1cbfb363e";
-
     let block_device = BlockDeviceMapping::builder()
         .device_name("/dev/sda1")
         .ebs(
@@ -148,7 +149,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let resp = client
         .run_instances()
-        .image_id(ami_id)
+        .image_id(args.ami_id)
         .instance_type(InstanceType::T32xlarge)
         .min_count(1)
         .max_count(1)

@@ -1,7 +1,8 @@
+use std::error::Error;
 use std::time::Duration;
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_ec2::{Client as Ec2Client, Client};
 use aws_sdk_route53::Client as Route53Client;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
@@ -30,31 +31,9 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
     let ec2 = Ec2Client::new(&config);
     let r53 = Route53Client::new(&config);
 
-    let desc = ec2
-        .describe_instances()
-        .instance_ids(&args.instance_id)
-        .send()
-        .await?;
-
-    let (instance_name, public_ip) = if let Some(res) = desc.reservations().first() {
-        if let Some(inst) = res.instances().first() {
-            let name = inst
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-                .unwrap_or("")
-                .to_string();
-
-            let ip = inst.public_ip_address().unwrap_or("").to_string();
-
-            (name, ip)
-        } else {
-            ("".to_string(), "".to_string())
-        }
-    } else {
-        ("".to_string(), "".to_string())
-    };
+    let (instance_name, public_ip) = get_instance_details(&ec2, &args.instance_id)
+        .await
+        .unwrap_or(("".to_string(), "".to_string()));
 
     let resp = ec2.terminate_instances()
         .instance_ids(&args.instance_id)
@@ -93,6 +72,35 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
     }
 
     Ok(())
+}
+
+async fn get_instance_details(ec2: &Client, instance_id: &str) -> Result<(String, String), Box<dyn Error>> {
+    let desc = ec2
+        .describe_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await?;
+
+    let instance = desc
+        .reservations()
+        .first()
+        .and_then(|reservation| reservation.instances().first())
+        .ok_or_else(|| format!("Instance {} not found", instance_id))?;
+
+    let name = instance
+        .tags()
+        .iter()
+        .find(|t| t.key() == Some("Name"))
+        .and_then(|t| t.value())
+        .unwrap_or("")
+        .to_string();
+
+    let ip = instance
+        .public_ip_address()
+        .unwrap_or("")
+        .to_string();
+
+    Ok((name, ip))
 }
 
 async fn wait_for_instance_termination(ec2: &Ec2Client, instance_id: &str) -> Result<(), Box<dyn std::error::Error>> {

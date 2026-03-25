@@ -1,7 +1,12 @@
+use std::time::Duration;
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_ec2::Client;
+use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_route53::Client as Route53Client;
+use aws_sdk_ec2::types::Filter;
+use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
 use clap::{Parser};
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 pub struct TerminateArgs {
@@ -15,10 +20,38 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
         .region(region_provider)
         .load()
         .await;
-    let client = Client::new(&config);
 
-    let resp = client.terminate_instances()
-        .instance_ids(args.instance_id)
+    let ec2 = Ec2Client::new(&config);
+    let r53 = Route53Client::new(&config);
+
+    let desc = ec2
+        .describe_instances()
+        .instance_ids(&args.instance_id)
+        .send()
+        .await?;
+
+    let (instance_name, public_ip) = if let Some(res) = desc.reservations().first() {
+        if let Some(inst) = res.instances().first() {
+            let name = inst
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+                .unwrap_or("")
+                .to_string();
+
+            let ip = inst.public_ip_address().unwrap_or("").to_string();
+
+            (name, ip)
+        } else {
+            ("".to_string(), "".to_string())
+        }
+    } else {
+        ("".to_string(), "".to_string())
+    };
+
+    let resp = ec2.terminate_instances()
+        .instance_ids(&args.instance_id)
         .send()
         .await?;
 
@@ -28,6 +61,114 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
         .unwrap_or("<unknown>");
 
     println!("Terminating instance: {}", terminating_instance);
+
+    if let Err(e) = wait_for_instance_termination(&ec2, &args.instance_id).await {
+        eprintln!("Warning: failed waiting for terminated state: {}", e);
+    }
+
+    if !instance_name.is_empty() && !public_ip.is_empty() {
+        if let Ok(hosted_zone_id) = std::env::var("ROA_HOSTED_ZONE_ID") {
+            let fqdn = format!("{}.ui.rancher.space", instance_name);
+
+            if let Err(e) = delete_dns_record(&r53, &hosted_zone_id, &fqdn, &public_ip).await {
+                eprintln!("Failed to delete DNS record {}: {}", fqdn, e);
+            } else {
+                println!("Deleted DNS record: {}", fqdn);
+            }
+        }
+    }
+
+    if !instance_name.is_empty() {
+        if let Ok(vpc_id) = std::env::var("ROA_VPC_ID") {
+            let sg_name = format!("roa-{}", instance_name);
+            if let Err(e) = delete_security_group(&ec2, &vpc_id, &sg_name).await {
+                eprintln!("Failed to delete security group {}: {}", sg_name, e);
+            } else {
+                println!("Deleted security group: {}", sg_name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn wait_for_instance_termination(ec2: &Ec2Client, instance_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..30 {
+        println!("Waiting for instance {} to terminate...", instance_id);
+
+        let resp = ec2
+            .describe_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await?;
+
+        if let Some(res) = resp.reservations().first() {
+            if let Some(inst) = res.instances().first() {
+                if let Some(state) = inst.state().and_then(|s| s.name()) {
+                    if *state == aws_sdk_ec2::types::InstanceStateName::Terminated {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    Err(format!("Instance {} did not reach terminated state", instance_id).into())
+}
+
+async fn delete_dns_record(r53: &aws_sdk_route53::Client , hosted_zone_id: &str, fqdn: &str, ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resource_record = ResourceRecord::builder().value(ip).build();
+
+    let resource_record_set = ResourceRecordSet::builder()
+        .name(fqdn)
+        .r#type(RrType::A)
+        .ttl(300)
+        .resource_records(resource_record?)
+        .build();
+
+    let change = Change::builder()
+        .action(ChangeAction::Delete)
+        .resource_record_set(resource_record_set?)
+        .build();
+
+    let batch = ChangeBatch::builder()
+        .changes(change?)
+        .build();
+
+    r53.change_resource_record_sets()
+        .hosted_zone_id(hosted_zone_id)
+        .change_batch(batch?)
+        .send()
+        .await?;
+
+    Ok(())
+}
+
+async fn delete_security_group(ec2: &aws_sdk_ec2::Client, vpc_id: &str, group_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = ec2
+        .describe_security_groups()
+        .filters(
+            Filter::builder()
+                .name("group-name")
+                .values(group_name)
+                .build(),
+        )
+        .filters(
+            Filter::builder()
+                .name("vpc-id")
+                .values(vpc_id)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    if let Some(security_group) = resp.security_groups().first() {
+        if let Some(id) = security_group.group_id() {
+            ec2.delete_security_group().group_id(id).send().await?;
+        }
+    }
 
     Ok(())
 }

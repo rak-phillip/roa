@@ -12,6 +12,12 @@ use tokio::time::sleep;
 pub struct TerminateArgs {
     #[clap(long)]
     instance_id: String,
+
+    #[arg(long, env = "ROA_HOSTED_ZONE_ID")]
+    hosted_zone_id: String,
+
+    #[arg(long, env = "ROA_VPC_ID")]
+    vpc_id: String,
 }
 
 pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -67,25 +73,22 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
     }
 
     if !instance_name.is_empty() && !public_ip.is_empty() {
-        if let Ok(hosted_zone_id) = std::env::var("ROA_HOSTED_ZONE_ID") {
-            let fqdn = format!("{}.ui.rancher.space", instance_name);
+        let fqdn = format!("{}.ui.rancher.space", instance_name);
 
-            if let Err(e) = delete_dns_record(&r53, &hosted_zone_id, &fqdn, &public_ip).await {
-                eprintln!("Failed to delete DNS record {}: {}", fqdn, e);
-            } else {
-                println!("Deleted DNS record: {}", fqdn);
-            }
+        if let Err(e) = delete_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await {
+            eprintln!("Failed to delete DNS record {}: {}", fqdn, e);
+        } else {
+            println!("Deleted DNS record: {}", fqdn);
         }
     }
 
     if !instance_name.is_empty() {
-        if let Ok(vpc_id) = std::env::var("ROA_VPC_ID") {
-            let sg_name = format!("roa-{}", instance_name);
-            if let Err(e) = delete_security_group(&ec2, &vpc_id, &sg_name).await {
-                eprintln!("Failed to delete security group {}: {}", sg_name, e);
-            } else {
-                println!("Deleted security group: {}", sg_name);
-            }
+        let sg_name = format!("roa-{}", instance_name);
+
+        if let Err(e) = delete_security_group(&ec2, &args.vpc_id, &sg_name).await {
+            eprintln!("Failed to delete security group {}: {}", sg_name, e);
+        } else {
+            println!("Deleted security group: {}", sg_name);
         }
     }
 

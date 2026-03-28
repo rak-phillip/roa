@@ -96,7 +96,7 @@ pub async fn get_public_ip(client: &Client, instance_id: &str) -> Result<String,
     Err("No public IP found".into())
 }
 
-pub async fn upsert_dns_record(r53: &route53::Client, hosted_zone_id: &str, fqdn: &str, ip: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn upsert_dns_record(r53: &route53::Client, hosted_zone_id: &str, fqdn: &str, ip: &str) -> Result<String, Box<dyn std::error::Error>> {
     let resource_record = ResourceRecord::builder()
         .value(ip)
         .build();
@@ -117,11 +117,19 @@ pub async fn upsert_dns_record(r53: &route53::Client, hosted_zone_id: &str, fqdn
         .changes(change?)
         .build();
 
-    r53.change_resource_record_sets()
+    let resp = r53.change_resource_record_sets()
         .hosted_zone_id(hosted_zone_id)
         .change_batch(batch?)
         .send()
         .await?;
 
-    Ok(())
+    let change_info = resp
+        .change_info()
+        .ok_or("Route53 did not return change info")?;
+
+    let change_id = change_info
+        .id()
+        .to_string();
+
+    Ok(change_id)
 }

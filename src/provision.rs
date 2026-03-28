@@ -1,3 +1,4 @@
+use std::time::Duration;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
 use aws_sdk_ec2::Client;
@@ -72,6 +73,9 @@ pub struct ProvisionArgs {
 
     #[arg(long, env = "ROA_AMI_ID")]
     ami_id: String,
+
+    #[arg(long, default_value_t = false)]
+    wait_for_ready: bool,
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -171,7 +175,64 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
     let public_ip = get_public_ip(&client, instance_id).await?;
     println!("Public IP: {}", public_ip);
 
-    upsert_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await?;
+    let change_id = upsert_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await?;
+
+    if args.wait_for_ready {
+        let url = format!("https://{}.ui.rancher.space/", args.name);
+        wait_for_dns(&r53, &change_id).await?;
+        wait_for_rancher(&url, Duration::from_secs(600)).await?;
+    }
 
     Ok(())
+}
+
+async fn wait_for_dns(r53: &aws_sdk_route53::Client, change_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut delay = Duration::from_secs(2);
+
+    for _ in 0..20 {
+        let resp = r53.get_change().id(change_id).send().await?;
+        let status = resp
+            .change_info()
+            .map(|ci| ci.status())
+            .unwrap_or(&aws_sdk_route53::types::ChangeStatus::Pending);
+
+        if matches!(status, &aws_sdk_route53::types::ChangeStatus::Insync) {
+            println!("DNS change status: {:?}", status);
+            return Ok(());
+        }
+
+        println!("Waiting for DNS to become INSYNC...");
+
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, Duration::from_secs(30));
+    }
+
+    Err("DNS change did not become INSYNC".into())
+}
+
+async fn wait_for_rancher(url: &str, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    let start = std::time::Instant::now();
+    let mut delay = Duration::from_secs(5);
+
+    while start.elapsed() < timeout {
+        match client.get(url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() || resp.status().is_redirection() {
+                    println!("Rancher is ready at {}", url);
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                eprintln!("Rancher not ready yet ({}): {}", url, e);
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, Duration::from_secs(60));
+    }
+
+    Err(format!("Rancher did not become ready at {}", url).into())
 }

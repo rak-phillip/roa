@@ -67,13 +67,11 @@ pub async fn get_public_ip(client: &Client, instance_id: &str) -> Result<String,
             .await
         {
             Ok(resp) => {
-                if let Some(reservation) = resp.reservations().first() {
-                    if let Some(instance) = reservation.instances().first() {
-                        if let Some(ip) = instance.public_ip_address() {
+                if let Some(reservation) = resp.reservations().first()
+                    && let Some(instance) = reservation.instances().first()
+                        && let Some(ip) = instance.public_ip_address() {
                             return Ok(ip.to_string());
                         }
-                    }
-                }
             }
 
             Err(sdk_error) => {

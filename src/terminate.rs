@@ -113,15 +113,12 @@ async fn wait_for_instance_termination(ec2: &Ec2Client, instance_id: &str) -> Re
             .send()
             .await?;
 
-        if let Some(res) = resp.reservations().first() {
-            if let Some(inst) = res.instances().first() {
-                if let Some(state) = inst.state().and_then(|s| s.name()) {
-                    if *state == aws_sdk_ec2::types::InstanceStateName::Terminated {
+        if let Some(res) = resp.reservations().first()
+            && let Some(inst) = res.instances().first()
+                && let Some(state) = inst.state().and_then(|s| s.name())
+                    && *state == aws_sdk_ec2::types::InstanceStateName::Terminated {
                         return Ok(());
                     }
-                }
-            }
-        }
 
         sleep(Duration::from_secs(5)).await;
     }
@@ -175,11 +172,10 @@ async fn delete_security_group(ec2: &aws_sdk_ec2::Client, vpc_id: &str, group_na
         .send()
         .await?;
 
-    if let Some(security_group) = resp.security_groups().first() {
-        if let Some(id) = security_group.group_id() {
+    if let Some(security_group) = resp.security_groups().first()
+        && let Some(id) = security_group.group_id() {
             ec2.delete_security_group().group_id(id).send().await?;
         }
-    }
 
     Ok(())
 }

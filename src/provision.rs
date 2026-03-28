@@ -104,7 +104,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         ProvisionMode::Helm => &*include_str!("../user-data")
             .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
-            .replace("\"<RANCHER_REPO>\"", &rancher_repo)
+            .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version),
         ProvisionMode::Docker => {
             let version = args.rancher_version
@@ -140,7 +140,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .build();
 
     let security_group_id = match args.security_group_id {
-        Some(id) => id.into(),
+        Some(id) => id,
         None => create_security_group(&client, &args.vpc_id, &args.name).await?,
     };
 

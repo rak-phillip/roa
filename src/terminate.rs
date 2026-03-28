@@ -54,20 +54,18 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
     if !instance_name.is_empty() && !public_ip.is_empty() {
         let fqdn = format!("{}.ui.rancher.space", instance_name);
 
-        if let Err(e) = delete_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await {
-            eprintln!("Failed to delete DNS record {}: {}", fqdn, e);
-        } else {
-            println!("Deleted DNS record: {}", fqdn);
+        match delete_dns_record(&r53, &args.hosted_zone_id, &fqdn, &public_ip).await {
+            Ok(_) => println!("Deleted DNS record: {}", fqdn),
+            Err(e) => eprintln!("Failed to delete DNS record {}: {}", fqdn, e),
         }
     }
 
     if !instance_name.is_empty() {
         let sg_name = format!("roa-{}", instance_name);
 
-        if let Err(e) = delete_security_group(&ec2, &args.vpc_id, &sg_name).await {
-            eprintln!("Failed to delete security group {}: {}", sg_name, e);
-        } else {
-            println!("Deleted security group: {}", sg_name);
+        match delete_security_group(&ec2, &args.vpc_id, &sg_name).await {
+            Ok(_) => println!("Deleted security group: {}", sg_name),
+            Err(e) => eprintln!("Failed to delete security group {}: {}", sg_name, e),
         }
     }
 

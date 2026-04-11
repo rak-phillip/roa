@@ -1,10 +1,12 @@
 use std::time::Duration;
 use aws_config::meta::region::RegionProviderChain;
-use aws_config::BehaviorVersion;
+use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
+use chrono::Utc;
+use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -79,7 +81,13 @@ pub struct ProvisionArgs {
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-west-2".to_string());
+
+    let region_provider = RegionProviderChain::default_provider()
+        .or_else(Region::new(region.clone()));
+
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
@@ -182,6 +190,25 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         wait_for_dns(&r53, &change_id).await?;
         wait_for_rancher(&url, Duration::from_secs(600)).await?;
     }
+
+    let provisioned_instance = Instance {
+        instance_id: String::from(instance_id),
+        name: args.name,
+        created_at: Utc::now().to_string(),
+        hosted_zone_id: args.hosted_zone_id,
+        public_ip,
+        fqdn,
+        security_group_id,
+        region,
+    };
+
+    let manifest_path = manifest_path();
+
+    let mut instances = load_instances(&manifest_path)?;
+
+    instances.push(provisioned_instance);
+
+    save_instances(&manifest_path, &instances)?;
 
     Ok(())
 }

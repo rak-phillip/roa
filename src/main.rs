@@ -1,8 +1,11 @@
 mod provision;
 mod terminate;
 mod network;
+mod list;
+mod instance;
 
 use clap::{Parser, Subcommand};
+use crate::list::{list, ListArgs};
 use crate::provision::{provision, ProvisionArgs};
 use crate::terminate::{terminate, TerminateArgs};
 
@@ -17,6 +20,7 @@ pub struct Cli {
 pub enum Commands{
     Provision(ProvisionArgs),
     Terminate(TerminateArgs),
+    List(ListArgs),
 }
 
 #[tokio::main]
@@ -35,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Terminate(args) => {
             terminate(args).await?;
+        },
+        Commands::List(args) => {
+            list(args).await?;
         }
     }
 

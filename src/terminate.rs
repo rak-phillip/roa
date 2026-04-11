@@ -8,6 +8,7 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
 use clap::{Parser};
 use tokio::time::sleep;
+use crate::instance::{load_instances, manifest_path, save_instances};
 
 #[derive(Parser, Debug)]
 pub struct TerminateArgs {
@@ -67,6 +68,18 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
             Ok(_) => println!("Deleted security group: {}", sg_name),
             Err(e) => eprintln!("Failed to delete security group {}: {}", sg_name, e),
         }
+    }
+
+    let manifest_path = manifest_path();
+
+    let mut instances = load_instances(&manifest_path)?;
+    let removed_idx = instances
+        .iter()
+        .position(|instance| instance.instance_id == args.instance_id);
+
+    if let Some(idx) = removed_idx {
+        instances.remove(idx);
+        save_instances(&manifest_path, &instances)?;
     }
 
     Ok(())

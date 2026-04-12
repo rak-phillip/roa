@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "roa"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aws-config",
  "aws-sdk-ec2",

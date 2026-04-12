@@ -18,8 +18,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands{
+    #[clap(about = "Launches an EC2 instance, creates a security group, and registers a DNS A record")]
     Provision(ProvisionArgs),
+    #[clap(about = "Terminates the EC2 instance and cleans up the Route 53 DNS record and the security group")]
     Terminate(TerminateArgs),
+    #[clap(about = "Displays all instances recorded in the local manifest")]
     List(ListArgs),
 }
 

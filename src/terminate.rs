@@ -12,13 +12,13 @@ use crate::instance::{load_instances, manifest_path, save_instances};
 
 #[derive(Parser, Debug)]
 pub struct TerminateArgs {
-    #[clap(long)]
+    #[clap(long, help = "EC2 instance ID to terminate")]
     instance_id: String,
 
-    #[arg(long, env = "ROA_HOSTED_ZONE_ID")]
+    #[arg(long, env = "ROA_HOSTED_ZONE_ID", help = "Route 53 hosted zone containing the DNS record", hide_env = true)]
     hosted_zone_id: String,
 
-    #[arg(long, env = "ROA_VPC_ID")]
+    #[arg(long, env = "ROA_VPC_ID", help = "VPC used to locate the security group for deletion", hide_env = true)]
     vpc_id: String,
 }
 

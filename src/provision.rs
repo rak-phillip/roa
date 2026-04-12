@@ -34,49 +34,49 @@ enum ProvisionMode {
 
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {
-    #[arg(long = "name")]
+    #[arg(long = "name", help = "Instance name. Also used as the subdomain: `<name>.ui.rancher.space`")]
     name: String,
 
-    #[arg(long, value_enum, default_value_t = ProvisionMode::Helm)]
+    #[arg(long, value_enum, default_value_t = ProvisionMode::Helm, help = "Install method: `helm` (k3d + Helm) or `docker`")]
     mode: ProvisionMode,
 
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64, help = "EBS root volume size in GB")]
     storage_gb: i32,
 
-    #[arg(long, env = "ROA_VPC_ID")]
+    #[arg(long, env = "ROA_VPC_ID", help = "VPC to launch the instance into", hide_env = true)]
     vpc_id: String,
 
-    #[arg(long, env = "ROA_SUBNET_ID")]
+    #[arg(long, env = "ROA_SUBNET_ID", help = "Subnet to attach the instance to", hide_env = true)]
     subnet_id: String,
 
-    #[arg(long)]
+    #[arg(long, help = "EC2 key pair name for SSH access")]
     key_name: String,
 
-    #[arg(long, env = "ROA_SECURITY_GROUP_ID")]
+    #[arg(long, env = "ROA_SECURITY_GROUP_ID", help = "Use an existing security group instead of creating one", hide_env = true)]
     security_group_id: Option<String>,
 
-    #[arg(long, env = "ROA_HOSTED_ZONE_ID")]
+    #[arg(long, env = "ROA_HOSTED_ZONE_ID", help = "Route 53 hosted zone ID for DNS management", hide_env = true)]
     hosted_zone_id: String,
 
-    #[arg(long)]
+    #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value_t = RancherRepo::Latest, value_enum)]
+    #[arg(long, default_value_t = RancherRepo::Latest, value_enum, help = "Rancher Helm chart repo: `latest`, `prime`, or `alpha`")]
     rancher_repo: RancherRepo,
 
-    #[arg(long)]
+    #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
     rancher_version: Option<String>,
 
-    #[arg(long, default_value = "rancher/rancher")]
+    #[arg(long, default_value = "rancher/rancher", help = "Docker image registry (Docker mode only)")]
     docker_registry: String,
 
-    #[arg(long)]
+    #[arg(long, help = "Override the Rancher hostname")]
     rancher_hostname: Option<String>,
 
-    #[arg(long, env = "ROA_AMI_ID")]
+    #[arg(long, env = "ROA_AMI_ID", help = "AMI ID to use (Ubuntu-based recommended)", hide_env = true)]
     ami_id: String,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = "Block until DNS propagates and Rancher is reachable")]
     wait_for_ready: bool,
 }
 

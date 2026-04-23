@@ -73,6 +73,9 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Override the Rancher hostname")]
     rancher_hostname: Option<String>,
 
+    #[arg(long, alias="password", help = "Set the Rancher bootstrap password")]
+    rancher_bootstrap_password: Option<String>,
+
     #[arg(long, env = "ROA_AMI_ID", help = "AMI ID to use (Ubuntu-based recommended)", hide_env = true)]
     ami_id: String,
 
@@ -108,12 +111,18 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let fqdn = format!("{}.ui.rancher.space", args.name);
 
+    let bootstrap_password_flag = match &args.rancher_bootstrap_password {
+        Some(password) => format!("--set bootstrapPassword=\"{}\"", password),
+        None => String::new(),
+    };
+
     let user_data_script = match args.mode {
         ProvisionMode::Helm => &*include_str!("../user-data")
             .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
-            .replace("\"<RANCHER_VERSION>\"", &rancher_version),
+            .replace("\"<RANCHER_VERSION>\"", &rancher_version)
+            .replace("\"<RANCHER_BOOTSTRAP_PASSWORD>\"", bootstrap_password_flag.as_str()),
         ProvisionMode::Docker => {
             let version = args.rancher_version
                 .as_deref()

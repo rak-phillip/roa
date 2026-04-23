@@ -75,4 +75,5 @@ helm install rancher rancher-latest/rancher \
   --set letsEncrypt.email="<LETS_ENCRYPT_EMAIL>" \
   --set letsEncrypt.ingress.class=traefik \
   --set agentTLSMode=system-store \
+  "<RANCHER_BOOTSTRAP_PASSWORD>" \
   "<RANCHER_VERSION>"

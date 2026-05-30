@@ -9,19 +9,36 @@ use chrono::Utc;
 use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone)]
 enum RancherRepo {
     Latest,
     Prime,
     Alpha,
+    ReleaseLine(String),
+}
+
+impl std::str::FromStr for RancherRepo {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "latest" => Ok(RancherRepo::Latest),
+            "prime" => Ok(RancherRepo::Prime),
+            "alpha" => Ok(RancherRepo::Alpha),
+            _ if s.starts_with("release-") => Ok(RancherRepo::ReleaseLine(s.to_string())),
+            _ => Err(format!("Invalid rancher repo: {}", s)),
+        }
+    }
 }
 
 impl RancherRepo {
-    fn value(&self) -> &str {
+    fn value(&self) -> String {
         match &self {
-            RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest",
-            RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime",
-            RancherRepo::Alpha => "https://charts.optimus.rancher.io/server-charts/alpha",
+            RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest".to_string(),
+            RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime".to_string(),
+            RancherRepo::Alpha => "https://charts.optimus.rancher.io/server-charts/alpha".to_string(),
+            RancherRepo::ReleaseLine(line) => {
+                format!("https://charts.optimus.rancher.io/server-charts/{}", line)
+            }
         }
     }
 }
@@ -61,7 +78,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value_t = RancherRepo::Latest, value_enum, help = "Rancher Helm chart repo: `latest`, `prime`, or `alpha`")]
+    #[arg(long, value_enum, help = "Rancher Helm chart repo: `latest`, `prime`, `alpha`, or release-<major>-<minor>")]
     rancher_repo: RancherRepo,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
@@ -103,11 +120,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         None => "--devel".to_string(),
     };
 
-    let rancher_repo = match &args.rancher_repo {
-        RancherRepo::Latest => RancherRepo::Latest.value(),
-        RancherRepo::Prime => RancherRepo::Prime.value(),
-        RancherRepo::Alpha => RancherRepo::Alpha.value(),
-    };
+    let rancher_repo = &args.rancher_repo.value();
 
     let fqdn = format!("{}.ui.rancher.space", args.name);
 

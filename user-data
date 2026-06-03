@@ -38,7 +38,7 @@ kubectl version --client
 helm version
 
 # Create a default k3d cluster
-k3d cluster create rancher-dev -p 80:80@loadbalancer -p 443:443@loadbalancer
+k3d cluster create rancher-dev "<K3S_IMAGE>" -p 80:80@loadbalancer -p 443:443@loadbalancer
 
 # Create .kube/config for user
 mkdir /home/ubuntu/.kube

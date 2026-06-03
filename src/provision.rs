@@ -93,11 +93,28 @@ pub struct ProvisionArgs {
     #[arg(long, alias="password", help = "Set the Rancher bootstrap password")]
     rancher_bootstrap_password: Option<String>,
 
+    #[arg(long, help = "Pin a specific k3s version for the k3d cluster (e.g. `v1.33.1-k3s1`). Required when Rancher's kubeVersion constraint excludes the latest k3s.")]
+    k3s_version: Option<String>,
+
     #[arg(long, env = "ROA_AMI_ID", help = "AMI ID to use (Ubuntu-based recommended)", hide_env = true)]
     ami_id: String,
 
     #[arg(long, default_value_t = false, help = "Block until DNS propagates and Rancher is reachable")]
     wait_for_ready: bool,
+}
+
+// Maps Rancher minor version to the highest k3s version certified by Rancher's support matrix.
+// Source: https://www.suse.com/suse-rancher/support-matrix/
+fn default_k3s_version(rancher_version: &str) -> Option<&'static str> {
+    let stripped = rancher_version.trim_start_matches('v');
+    let minor = stripped.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
+    match minor.as_str() {
+        "2.11" => Some("v1.32.3-k3s1"),
+        "2.12" => Some("v1.33.3-k3s1"),
+        "2.13" => Some("v1.34.3-k3s1"),
+        "2.14" => Some("v1.35.5-k3s1"),
+        _ => None,
+    }
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -129,13 +146,24 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         None => String::new(),
     };
 
+    let k3s_image_flag = match args.k3s_version.as_deref()
+        .or_else(|| args.rancher_version.as_deref().and_then(default_k3s_version))
+    {
+        Some(version) => {
+            println!("Using k3s version: {}", version);
+            format!("--image rancher/k3s:{}", version)
+        }
+        None => String::new(),
+    };
+
     let user_data_script = match args.mode {
         ProvisionMode::Helm => &*include_str!("../user-data")
             .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version)
-            .replace("\"<RANCHER_BOOTSTRAP_PASSWORD>\"", bootstrap_password_flag.as_str()),
+            .replace("\"<RANCHER_BOOTSTRAP_PASSWORD>\"", bootstrap_password_flag.as_str())
+            .replace("\"<K3S_IMAGE>\"", &k3s_image_flag),
         ProvisionMode::Docker => {
             let version = args.rancher_version
                 .as_deref()

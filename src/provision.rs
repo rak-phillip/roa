@@ -78,7 +78,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, value_enum, help = "Rancher Helm chart repo: `latest`, `prime`, `alpha`, or release-<major>-<minor>")]
+    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `alpha`, or release-<major>-<minor>")]
     rancher_repo: RancherRepo,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]

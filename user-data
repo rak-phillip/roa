@@ -19,7 +19,9 @@ sudo systemctl enable docker
 sudo systemctl start docker
 
 # Install k3d
-wget -q -O - https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+K3D_VERSION="v5.9.0"
+wget -q -O install-k3d.sh "https://raw.githubusercontent.com/k3d-io/k3d/${K3D_VERSION}/install.sh"
+TAG=${K3D_VERSION} bash install-k3d.sh
 
 # Install Helm
 curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null

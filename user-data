@@ -11,17 +11,22 @@ sudo apt-get install -y \
     software-properties-common \
     uidmap
 
-# Install Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
+# Install Docker from the official apt repository (avoids running a downloaded install script)
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 sudo usermod -aG docker ubuntu
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# Install k3d
+# Install k3d (pinned version, verified against published checksum)
 K3D_VERSION="v5.9.0"
-wget -q -O install-k3d.sh "https://raw.githubusercontent.com/k3d-io/k3d/${K3D_VERSION}/install.sh"
-TAG=${K3D_VERSION} bash install-k3d.sh
+K3D_SUM_amd64="06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0"
+curl -fsSL -o k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+echo "${K3D_SUM_amd64}  k3d" | sha256sum -c -
+chmod +x k3d
+sudo mv k3d /usr/local/bin/k3d
 
 # Install Helm
 curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
@@ -29,8 +34,11 @@ echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.co
 sudo apt-get update
 sudo apt-get install helm
 
-# Install kubectl
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+# Install kubectl (pinned version, verified against published checksum)
+KUBECTL_VERSION="v1.36.2"
+curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+curl -fsSL -o kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c -
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 
 # Verify installations

@@ -20,13 +20,14 @@ sudo usermod -aG docker ubuntu
 sudo systemctl enable docker
 sudo systemctl start docker
 
-# Install k3d (pinned version, verified against published checksum)
+# Install k3d (pinned version, verified against published checksum file)
 K3D_VERSION="v5.9.0"
-K3D_SUM_amd64="06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0"
-curl -fsSL -o k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
-echo "${K3D_SUM_amd64}  k3d" | sha256sum -c -
-chmod +x k3d
-sudo mv k3d /usr/local/bin/k3d
+curl -fsSL -o k3d-linux-amd64 "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+curl -fsSL -o k3d-checksums.txt "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/checksums.txt"
+K3D_HASH=$(grep "k3d-linux-amd64$" k3d-checksums.txt | awk '{print $1}')
+echo "${K3D_HASH}  k3d-linux-amd64" | sha256sum -c -
+chmod +x k3d-linux-amd64
+sudo mv k3d-linux-amd64 /usr/local/bin/k3d
 
 # Install Helm
 curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null

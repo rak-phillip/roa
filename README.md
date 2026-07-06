@@ -87,11 +87,12 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mode` | `helm` | Install method: `helm` (k3d + Helm) or `docker` |
+| `--mode` | `helm` | Install method: `helm` (k3s + Helm) or `docker` |
 | `--storage-gb` | `64` | EBS root volume size in GB |
 | `--security-group-id` | *(auto-created)* | Use an existing security group instead of creating one |
 | `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, or `alpha` |
 | `--rancher-version` | *(latest dev)* | Pin a specific Rancher version (e.g. `2.9.0`) |
+| `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
 | `--docker-registry` | `rancher/rancher` | Docker image registry (Docker mode only) |
 | `--wait-for-ready` | `false` | Block until DNS propagates and Rancher is reachable |
@@ -147,10 +148,50 @@ i-0123456789abcdef0  my-rancher  203.0.113.42  my-rancher.ui.rancher.space
 ## How it works
 
 1. **Provision** launches a `t3.2xlarge` EC2 instance with a user-data bootstrap script
-   - **Helm mode** (default): installs Docker, k3d, kubectl, Helm, cert-manager, and Rancher via Helm
+   - **Helm mode** (default): installs single-node k3s, kubectl, Helm, the system-upgrade-controller, cert-manager, and Rancher via Helm
    - **Docker mode**: runs Rancher directly as a Docker container
 2. A security group with the necessary inbound rules is created (or an existing one is reused)
 3. An Elastic IP or public IP is assigned, and an A record is upserted in Route 53
+
+## Upgrading k3s
+
+Helm-mode instances run k3s directly on the host, so the management cluster's Kubernetes version is upgradeable. Two options:
+
+### Re-run the installer
+
+Over SSH on the instance:
+
+```bash
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.37.1+k3s1 sh -
+```
+
+k3s replaces its binary and restarts in place.
+
+### system-upgrade-controller
+
+`system-upgrade-controller` is installed when RoA provisions Rancher. Apply a Plan naming the target version and it 
+handles the upgrade:
+
+```yaml
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-server
+  namespace: system-upgrade
+spec:
+  concurrency: 1
+  version: v1.37.1+k3s1 # desired k3s release
+  serviceAccountName: system-upgrade
+  cordon: true
+  nodeSelector:
+    matchExpressions:
+      - { key: node-role.kubernetes.io/control-plane, operator: In, values: ["true"] }
+  upgrade:
+    image: rancher/k3s-upgrade
+```
+
+Keep the k3s version within Rancher's supported Kubernetes range (see the support matrix), and upgrade Rancher itself 
+separately via `helm upgrade` on the `rancher` release.
 
 ## AWS permissions
 

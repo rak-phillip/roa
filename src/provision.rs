@@ -54,7 +54,7 @@ pub struct ProvisionArgs {
     #[arg(long = "name", help = "Instance name. Also used as the subdomain: `<name>.ui.rancher.space`")]
     name: String,
 
-    #[arg(long, value_enum, default_value_t = ProvisionMode::Helm, help = "Install method: `helm` (k3d + Helm) or `docker`")]
+    #[arg(long, value_enum, default_value_t = ProvisionMode::Helm, help = "Install method: `helm` (k3s + Helm) or `docker`")]
     mode: ProvisionMode,
 
     #[arg(long, default_value_t = 64, help = "EBS root volume size in GB")]
@@ -93,7 +93,7 @@ pub struct ProvisionArgs {
     #[arg(long, alias="password", help = "Set the Rancher bootstrap password")]
     rancher_bootstrap_password: Option<String>,
 
-    #[arg(long, help = "Pin a specific k3s version for the k3d cluster (e.g. `v1.33.1-k3s1`). Required when Rancher's kubeVersion constraint excludes the latest k3s.")]
+    #[arg(long, help = "Pin a specific k3s version (e.g. `v1.36.2+k3s1`). Defaults per Rancher minor; falls back to the k3s installer's latest stable when the Rancher version is unknown or unpinned.")]
     k3s_version: Option<String>,
 
     #[arg(long, env = "ROA_AMI_ID", help = "AMI ID to use (Ubuntu-based recommended)", hide_env = true)]
@@ -104,15 +104,17 @@ pub struct ProvisionArgs {
 }
 
 // Maps Rancher minor version to the highest k3s version certified by Rancher's support matrix.
+// Returns the k3s release version (e.g. `v1.36.2+k3s1`).
 // Source: https://www.suse.com/suse-rancher/support-matrix/
 fn default_k3s_version(rancher_version: &str) -> Option<&'static str> {
     let stripped = rancher_version.trim_start_matches('v');
     let minor = stripped.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
     match minor.as_str() {
-        "2.11" => Some("v1.32.3-k3s1"),
-        "2.12" => Some("v1.33.3-k3s1"),
-        "2.13" => Some("v1.34.3-k3s1"),
-        "2.14" => Some("v1.35.5-k3s1"),
+        "2.11" => Some("v1.32.3+k3s1"),
+        "2.12" => Some("v1.33.3+k3s1"),
+        "2.13" => Some("v1.34.3+k3s1"),
+        "2.14" => Some("v1.35.5+k3s1"),
+        "2.15" => Some("v1.36.2+k3s1"),
         _ => None,
     }
 }
@@ -146,14 +148,17 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         None => String::new(),
     };
 
-    let k3s_image_flag = match args.k3s_version.as_deref()
+    let k3s_version = match args.k3s_version.as_deref()
         .or_else(|| args.rancher_version.as_deref().and_then(default_k3s_version))
     {
         Some(version) => {
             println!("Using k3s version: {}", version);
-            format!("--image rancher/k3s:{}", version)
+            version.to_string()
         }
-        None => String::new(),
+        None => {
+            println!("No k3s version pinned; the k3s installer will use the latest stable release");
+            String::new()
+        }
     };
 
     let user_data_script = match args.mode {
@@ -163,7 +168,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version)
             .replace("\"<RANCHER_BOOTSTRAP_PASSWORD>\"", bootstrap_password_flag.as_str())
-            .replace("\"<K3S_IMAGE>\"", &k3s_image_flag),
+            .replace("\"<K3S_VERSION>\"", &k3s_version),
         ProvisionMode::Docker => {
             let version = args.rancher_version
                 .as_deref()

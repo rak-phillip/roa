@@ -7,33 +7,32 @@ sudo apt-get install -y \
     ca-certificates \
     curl \
     gnupg \
-    lsb-release \
-    software-properties-common \
-    uidmap
+    lsb-release
 
-# Install Docker from the official apt repository (avoids running a downloaded install script)
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt-get update -y
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-sudo usermod -aG docker ubuntu
-sudo systemctl enable docker
-sudo systemctl start docker
+# Install k3s single-node
+curl -fsSL -o k3s-install.sh https://get.k3s.io
+chmod +x k3s-install.sh
+sudo INSTALL_K3S_VERSION="<K3S_VERSION>" K3S_KUBECONFIG_MODE="644" ./k3s-install.sh
 
-# Install k3d (pinned version, verified against published checksum file)
-K3D_VERSION="v5.9.0"
-curl -fsSL -o k3d-linux-amd64 "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
-curl -fsSL -o k3d-checksums.txt "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/checksums.txt"
-K3D_HASH=$(grep "k3d-linux-amd64$" k3d-checksums.txt | awk '{print $1}')
-echo "${K3D_HASH}  k3d-linux-amd64" | sha256sum -c -
-chmod +x k3d-linux-amd64
-sudo mv k3d-linux-amd64 /usr/local/bin/k3d
+# Point this script (running as root) at the k3s kubeconfig
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+# Wait for the node/API server to come up before driving kubectl/helm
+until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do
+    echo "Waiting for k3s to be ready..."
+    sleep 5
+done
+
+# Make the kubeconfig available to the ubuntu SSH user as well
+mkdir -p /home/ubuntu/.kube
+cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
 
 # Install Helm
 curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
 sudo apt-get update
-sudo apt-get install helm
+sudo apt-get install -y helm
 
 # Install kubectl (pinned version, verified against published checksum)
 KUBECTL_VERSION="v1.36.2"
@@ -43,17 +42,12 @@ echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c -
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 
 # Verify installations
-docker --version
-k3d version
 kubectl version --client
 helm version
 
-# Create a default k3d cluster
-k3d cluster create rancher-dev "<K3S_IMAGE>" -p 80:80@loadbalancer -p 443:443@loadbalancer
-
-# Create .kube/config for user
-mkdir /home/ubuntu/.kube
-k3d kubeconfig get rancher-dev > /home/ubuntu/.kube/config
+# Install the system-upgrade-controller for managed, in-place k3s upgrades over time.
+kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/latest/download/crd.yaml
+kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/latest/download/system-upgrade-controller.yaml
 
 # Get public IP of ec2 instance
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
@@ -70,8 +64,6 @@ helm repo add rancher-latest "<RANCHER_REPO>"
 kubectl create namespace cert-manager
 
 kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v1.16.3/cert-manager.crds.yaml
-
-helm repo add jetstack https://charts.jetstack.io
 
 helm repo update
 

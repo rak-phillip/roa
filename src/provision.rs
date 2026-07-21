@@ -13,7 +13,8 @@ use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 enum RancherRepo {
     Latest,
     Prime,
-    Alpha,
+    PrimeAlpha,
+    CommunityAlpha,
     ReleaseLine(String),
 }
 
@@ -23,7 +24,10 @@ impl std::str::FromStr for RancherRepo {
         match s {
             "latest" => Ok(RancherRepo::Latest),
             "prime" => Ok(RancherRepo::Prime),
-            "alpha" => Ok(RancherRepo::Alpha),
+            // `alpha` kept as a backward-compatible alias for `prime-alpha`,
+            // which is where it has always pointed.
+            "alpha" | "prime-alpha" => Ok(RancherRepo::PrimeAlpha),
+            "community-alpha" => Ok(RancherRepo::CommunityAlpha),
             _ if s.starts_with("release-") => Ok(RancherRepo::ReleaseLine(s.to_string())),
             _ => Err(format!("Invalid rancher repo: {}", s)),
         }
@@ -35,7 +39,8 @@ impl RancherRepo {
         match &self {
             RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest".to_string(),
             RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime".to_string(),
-            RancherRepo::Alpha => "https://charts.optimus.rancher.io/server-charts/alpha".to_string(),
+            RancherRepo::PrimeAlpha => "https://charts.optimus.rancher.io/server-charts/alpha".to_string(),
+            RancherRepo::CommunityAlpha => "https://releases.rancher.com/server-charts/alpha".to_string(),
             RancherRepo::ReleaseLine(line) => {
                 format!("https://charts.optimus.rancher.io/server-charts/{}", line)
             }
@@ -78,7 +83,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `alpha`, or release-<major>-<minor>")]
+    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
     rancher_repo: RancherRepo,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]

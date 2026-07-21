@@ -90,7 +90,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--mode` | `helm` | Install method: `helm` (k3s + Helm) or `docker` |
 | `--storage-gb` | `64` | EBS root volume size in GB |
 | `--security-group-id` | *(auto-created)* | Use an existing security group instead of creating one |
-| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, or `alpha` |
+| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>-<minor>` |
 | `--rancher-version` | *(latest dev)* | Pin a specific Rancher version (e.g. `2.9.0`) |
 | `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |

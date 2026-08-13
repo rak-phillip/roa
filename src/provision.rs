@@ -13,6 +13,7 @@ use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 enum RancherRepo {
     Latest,
     Prime,
+    PrimeLatest,
     PrimeAlpha,
     CommunityAlpha,
     ReleaseLine(String),
@@ -24,6 +25,7 @@ impl std::str::FromStr for RancherRepo {
         match s {
             "latest" => Ok(RancherRepo::Latest),
             "prime" => Ok(RancherRepo::Prime),
+            "prime-latest" => Ok(RancherRepo::PrimeLatest),
             // `alpha` kept as a backward-compatible alias for `prime-alpha`,
             // which is where it has always pointed.
             "alpha" | "prime-alpha" => Ok(RancherRepo::PrimeAlpha),
@@ -39,6 +41,7 @@ impl RancherRepo {
         match &self {
             RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest".to_string(),
             RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime".to_string(),
+            RancherRepo::PrimeLatest => "https://charts.optimus.rancher.io/server-charts/latest".to_string(),
             RancherRepo::PrimeAlpha => "https://charts.optimus.rancher.io/server-charts/alpha".to_string(),
             RancherRepo::CommunityAlpha => "https://releases.rancher.com/server-charts/alpha".to_string(),
             RancherRepo::ReleaseLine(line) => {
@@ -83,7 +86,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
+    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
     rancher_repo: RancherRepo,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
@@ -120,6 +123,7 @@ fn default_k3s_version(rancher_version: &str) -> Option<&'static str> {
         "2.13" => Some("v1.34.3+k3s1"),
         "2.14" => Some("v1.35.5+k3s1"),
         "2.15" => Some("v1.36.2+k3s1"),
+        "2.16" => Some("v1.36.3+k3s1"),
         _ => None,
     }
 }

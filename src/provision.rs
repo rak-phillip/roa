@@ -25,9 +25,6 @@ impl std::str::FromStr for RancherRepo {
         match s {
             "latest" => Ok(RancherRepo::Latest),
             "prime" => Ok(RancherRepo::Prime),
-            // Holds every Prime pre-release chart — RC, head, and eventually alpha —
-            // across all release lines, so always pair this with a pinned
-            // `--rancher-version`. `--devel` resolves by semver, not publish date.
             "prime-latest" => Ok(RancherRepo::PrimeLatest),
             // `alpha` kept as a backward-compatible alias for `prime-alpha`,
             // which is where it has always pointed.
@@ -126,6 +123,7 @@ fn default_k3s_version(rancher_version: &str) -> Option<&'static str> {
         "2.13" => Some("v1.34.3+k3s1"),
         "2.14" => Some("v1.35.5+k3s1"),
         "2.15" => Some("v1.36.2+k3s1"),
+        "2.16" => Some("v1.36.3+k3s1"),
         _ => None,
     }
 }

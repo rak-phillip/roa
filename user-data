@@ -35,7 +35,7 @@ sudo apt-get update
 sudo apt-get install -y helm
 
 # Install kubectl (pinned version, verified against published checksum)
-KUBECTL_VERSION="v1.36.2"
+KUBECTL_VERSION="v1.36.3"
 curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
 curl -fsSL -o kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
 echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c -

@@ -9,6 +9,27 @@ sudo apt-get install -y \
     gnupg \
     lsb-release
 
+# Widen unattended-upgrades to cover the `-updates` pocket as well as `-security`.
+# Ubuntu's shipped Allowed-Origins covers the release pocket, `-security` and the ESM pockets, but
+# not `-updates`, which leaves ordinary fixes to pile up unapplied (on the shared instance that was
+# 191 pending against 137 security). Written as a drop-in rather than an edit to
+# /etc/apt/apt.conf.d/50unattended-upgrades so it survives upgrades of the unattended-upgrades
+# package and is trivial to verify with `apt-config dump | grep Allowed-Origins`.
+#
+# Automatic-Reboot is deliberately left OFF. This is a decision, not an oversight: kernel updates
+# install here but only take effect when a human reboots during the weekly maintenance window.
+# Policy is to automate OS patching while keeping runtime and app restarts deliberate.
+sudo tee /etc/apt/apt.conf.d/52roa-unattended-upgrades > /dev/null <<'APTEOF'
+// The shipped 50unattended-upgrades already allows the release pocket, -security and the two
+// ESM pockets. `::` appends one more entry to that list rather than restating it -- using the
+// `{ ... }` block form here would append a second copy of every default.
+Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-updates";
+
+// Deliberately off -- see the comment in roa's user-data. Kernel updates are applied by a
+// human during the weekly maintenance window, not at 06:00 unattended.
+Unattended-Upgrade::Automatic-Reboot "false";
+APTEOF
+
 # Install k3s single-node
 curl -fsSL -o k3s-install.sh https://get.k3s.io
 chmod +x k3s-install.sh
@@ -48,6 +69,19 @@ helm version
 # Install the system-upgrade-controller for managed, in-place k3s upgrades over time.
 kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/latest/download/crd.yaml
 kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/latest/download/system-upgrade-controller.yaml
+
+# The controller does nothing without a Plan. roa substitutes one below, pinned to the channel for
+# the *minor* of the k3s version installed above -- never `stable` or `latest`.
+#
+# Rancher's chart declares an upper Kubernetes bound (the 2.16 head charts use `kubeVersion:
+# < 1.37.0-0`). `stable` and `latest` happen to resolve inside that bound today, but they will move
+# to the next minor. If the controller took the node across it, the running Rancher would keep
+# working while the next `helm upgrade` was silently refused -- blocking every future Rancher bump.
+# A `vX.Y` channel tracks patches within the minor and cannot cross it.
+#
+# When no k3s version is pinned the substitution is empty and no Plan is written, rather than
+# guessing at a channel.
+"<K3S_UPGRADE_PLAN>"
 
 # Get public IP of ec2 instance
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")

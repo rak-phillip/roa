@@ -12,6 +12,10 @@ pub struct Instance {
     pub hosted_zone_id: String,
     pub region: String,
     pub created_at: String,
+    // Chart repo URL Rancher was installed from. Optional so manifests written before this
+    // field existed still load; `maintain` falls back to its own flag when it is absent.
+    #[serde(default)]
+    pub rancher_repo: Option<String>,
 }
 
 pub fn manifest_path() -> PathBuf {

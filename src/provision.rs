@@ -10,7 +10,7 @@ use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
 #[derive(Debug, Clone)]
-enum RancherRepo {
+pub enum RancherRepo {
     Latest,
     Prime,
     PrimeLatest,
@@ -37,7 +37,7 @@ impl std::str::FromStr for RancherRepo {
 }
 
 impl RancherRepo {
-    fn value(&self) -> String {
+    pub fn value(&self) -> String {
         match &self {
             RancherRepo::Latest => "https://releases.rancher.com/server-charts/latest".to_string(),
             RancherRepo::Prime => "https://charts.rancher.com/server-charts/prime".to_string(),
@@ -128,6 +128,54 @@ fn default_k3s_version(rancher_version: &str) -> Option<&'static str> {
     }
 }
 
+// Reduces a pinned k3s release to the k3s release channel for its minor:
+// `v1.36.3+k3s1` -> `v1.36`. Returns None for anything that isn't a pinned `vX.Y.Z` version,
+// which is the signal to write no upgrade Plan at all rather than guess at a channel.
+fn k3s_minor_channel(k3s_version: &str) -> Option<String> {
+    let stripped = k3s_version.trim().trim_start_matches('v');
+    let mut parts = stripped.split('.');
+
+    let major = parts.next().filter(|p| !p.is_empty())?;
+    let minor = parts.next().filter(|p| !p.is_empty())?;
+
+    // Anything after the minor must look like a patch, so a bare `v1.36` or a stray
+    // `stable` never silently becomes a channel.
+    let patch = parts.next()?;
+    if !patch.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+
+    if !major.chars().all(|c| c.is_ascii_digit()) || !minor.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(format!("v{}.{}", major, minor))
+}
+
+// Renders the shell that applies a system-upgrade-controller Plan tracking `channel`.
+// The channel is always minor-pinned; see the comment in `user-data` for why.
+fn k3s_upgrade_plan(channel: &str) -> String {
+    format!(
+        r#"kubectl apply -f - <<'PLANEOF'
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: k3s-server
+  namespace: system-upgrade
+spec:
+  concurrency: 1
+  channel: https://update.k3s.io/v1-release/channels/{channel}
+  serviceAccountName: system-upgrade
+  cordon: true
+  nodeSelector:
+    matchExpressions:
+      - {{ key: node-role.kubernetes.io/control-plane, operator: In, values: ["true"] }}
+  upgrade:
+    image: rancher/k3s-upgrade
+PLANEOF"#
+    )
+}
+
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -170,6 +218,17 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         }
     };
 
+    let k3s_upgrade_plan = match k3s_minor_channel(&k3s_version) {
+        Some(channel) => {
+            println!("Pinning the k3s upgrade Plan to channel: {}", channel);
+            k3s_upgrade_plan(&channel)
+        }
+        None => {
+            println!("No k3s minor to pin; writing no k3s upgrade Plan");
+            String::new()
+        }
+    };
+
     let user_data_script = match args.mode {
         ProvisionMode::Helm => &*include_str!("../user-data")
             .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
@@ -177,7 +236,8 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version)
             .replace("\"<RANCHER_BOOTSTRAP_PASSWORD>\"", bootstrap_password_flag.as_str())
-            .replace("\"<K3S_VERSION>\"", &k3s_version),
+            .replace("\"<K3S_VERSION>\"", &k3s_version)
+            .replace("\"<K3S_UPGRADE_PLAN>\"", &k3s_upgrade_plan),
         ProvisionMode::Docker => {
             let version = args.rancher_version
                 .as_deref()
@@ -264,6 +324,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         fqdn,
         security_group_id,
         region,
+        rancher_repo: Some(rancher_repo.to_string()),
     };
 
     let manifest_path = manifest_path();
@@ -326,4 +387,73 @@ async fn wait_for_rancher(url: &str, timeout: Duration) -> Result<(), Box<dyn st
     }
 
     Err(format!("Rancher did not become ready at {}", url).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduces_a_pinned_k3s_release_to_its_minor_channel() {
+        assert_eq!(k3s_minor_channel("v1.36.3+k3s1").as_deref(), Some("v1.36"));
+        assert_eq!(k3s_minor_channel("1.35.5+k3s1").as_deref(), Some("v1.35"));
+        assert_eq!(k3s_minor_channel(" v1.32.3+k3s1 ").as_deref(), Some("v1.32"));
+    }
+
+    #[test]
+    fn refuses_to_guess_a_channel_from_an_unpinned_version() {
+        // An empty version is what `provision` passes when nothing is pinned; writing a Plan
+        // then would guess at a channel.
+        assert_eq!(k3s_minor_channel(""), None);
+        assert_eq!(k3s_minor_channel("v1.36"), None);
+        assert_eq!(k3s_minor_channel("stable"), None);
+        assert_eq!(k3s_minor_channel("latest"), None);
+        assert_eq!(k3s_minor_channel("v1.x.3"), None);
+    }
+
+    #[test]
+    fn every_default_k3s_version_yields_a_channel() {
+        for rancher in ["2.11", "2.12", "2.13", "2.14", "2.15", "2.16"] {
+            let k3s = default_k3s_version(rancher).expect("mapped");
+            assert!(
+                k3s_minor_channel(k3s).is_some(),
+                "{} -> {} has no channel",
+                rancher,
+                k3s
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_pins_the_channel_and_never_a_floating_one() {
+        let plan = k3s_upgrade_plan("v1.36");
+        assert!(plan.contains("https://update.k3s.io/v1-release/channels/v1.36"));
+        assert!(!plan.contains("channels/stable"));
+        assert!(!plan.contains("channels/latest"));
+        assert!(plan.contains("namespace: system-upgrade"));
+        assert!(plan.contains("image: rancher/k3s-upgrade"));
+    }
+
+    #[test]
+    fn user_data_carries_the_plan_placeholder() {
+        assert!(include_str!("../user-data").contains("\"<K3S_UPGRADE_PLAN>\""));
+    }
+
+    #[test]
+    fn rendering_user_data_substitutes_or_removes_the_plan() {
+        let template = include_str!("../user-data");
+
+        let channel = k3s_minor_channel("v1.36.3+k3s1").unwrap();
+        let with_plan = template.replace("\"<K3S_UPGRADE_PLAN>\"", &k3s_upgrade_plan(&channel));
+        assert!(with_plan.contains("kind: Plan"));
+        assert!(with_plan.contains("channels/v1.36"));
+        assert!(!with_plan.contains("<K3S_UPGRADE_PLAN>"));
+        // The Plan is applied as a heredoc; an unbalanced marker would break provisioning.
+        assert_eq!(with_plan.matches("PLANEOF").count(), 2);
+
+        // Unpinned k3s leaves no Plan behind at all.
+        let without_plan = template.replace("\"<K3S_UPGRADE_PLAN>\"", "");
+        assert!(!without_plan.contains("kind: Plan"));
+        assert!(!without_plan.contains("<K3S_UPGRADE_PLAN>"));
+    }
 }

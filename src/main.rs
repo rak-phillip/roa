@@ -1,3 +1,4 @@
+mod maintain;
 mod provision;
 mod terminate;
 mod network;
@@ -6,6 +7,7 @@ mod instance;
 
 use clap::{Parser, Subcommand};
 use crate::list::{list, ListArgs};
+use crate::maintain::{maintain, MaintainArgs};
 use crate::provision::{provision, ProvisionArgs};
 use crate::terminate::{terminate, TerminateArgs};
 
@@ -24,6 +26,8 @@ pub enum Commands{
     Terminate(TerminateArgs),
     #[clap(about = "Displays all instances recorded in the local manifest")]
     List(ListArgs),
+    #[clap(about = "Reports on an instance's OS, k3s, Rancher chart and snapshot state. Exits non-zero when something needs attention")]
+    Maintain(MaintainArgs),
 }
 
 #[tokio::main]
@@ -45,6 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::List(args) => {
             list(args).await?;
+        },
+        Commands::Maintain(args) => {
+            maintain(args).await?;
         }
     }
 

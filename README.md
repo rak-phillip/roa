@@ -90,7 +90,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--mode` | `helm` | Install method: `helm` (k3s + Helm) or `docker` |
 | `--storage-gb` | `64` | EBS root volume size in GB |
 | `--security-group-id` | *(auto-created)* | Use an existing security group instead of creating one |
-| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>-<minor>` |
+| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>-<minor>` |
 | `--rancher-version` | *(latest dev)* | Pin a specific Rancher version (e.g. `2.9.0`) |
 | `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
@@ -145,6 +145,54 @@ roa list
 i-0123456789abcdef0  my-rancher  203.0.113.42  my-rancher.ui.rancher.space
 ```
 
+### `maintain` — Weekly health report
+
+Reports on an instance's OS patch level, k3s version, `system-upgrade-controller` Plan, running
+Rancher chart, disk usage, cluster health and EBS snapshot age. Read-only — it changes nothing.
+
+```
+roa maintain --name <NAME> [OPTIONS]
+```
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--name` | | | Instance name as recorded in the local manifest |
+| `--ssh-user` | | `ubuntu` | SSH user on the instance |
+| `--ssh-key` | `ROA_SSH_KEY` | *(ssh-agent / `~/.ssh/config`)* | Private key for SSH |
+| `--rancher-repo` | | `prime-latest` | Chart repo to compare against. Only used when the manifest doesn't record one |
+| `--json` | | `false` | Emit the report as JSON |
+
+On-box checks run over SSH in a single batched command; the chart index, k3s release channel and
+EBS snapshot checks run locally. If SSH fails the on-box checks report `UNKNOWN` and the rest of
+the report still runs.
+
+**Exits non-zero when any check needs attention**, so it can be dropped into a scheduler unchanged.
+
+**Example:**
+
+```bash
+roa maintain --name shared
+```
+
+```
+shared (i-0123456789abcdef0) shared.ui.rancher.space [us-west-2]
+
+  os-updates        ATTENTION  57 pending, 1 security
+  reboot            ATTENTION  reboot required for: libc6 linux-image-7.0.0-1010-aws linux-base
+  k3s-version       OK         v1.36.3+k3s1 (current for channel v1.36)
+  k3s-upgrade-plan  ATTENTION  no system-upgrade-controller Plan -- k3s patches are not being applied
+  rancher-chart     ATTENTION  running rancher-2.16.0-9575c72...-head; newest head is 2.16.0-3ad9f7f...-head published 2026-08-18 20:49 UTC
+  disk              OK         root 38% used, containerd 20G
+  clusters          OK         mo-test (c-m-5g5m2dxf) Connected=True, local (local) Ready=True
+  snapshot          ATTENTION  no snapshots of the root volume -- no restore point
+
+5 need attention, 0 unknown
+```
+
+Head charts are picked by **publish date**, never by semver — the pre-release repos carry several
+Rancher minors side by side and every head version is `<minor>.0-<sha>-head`, which semver ranks by
+an arbitrary hex string.
+
 ## How it works
 
 1. **Provision** launches a `t3.2xlarge` EC2 instance with a user-data bootstrap script
@@ -169,8 +217,8 @@ k3s replaces its binary and restarts in place.
 
 ### system-upgrade-controller
 
-`system-upgrade-controller` is installed when RoA provisions Rancher. Apply a Plan naming the target version and it 
-handles the upgrade:
+`system-upgrade-controller` is installed when RoA provisions Rancher, and `provision` now also writes
+a Plan tracking the k3s release channel for the **minor** it installed:
 
 ```yaml
 apiVersion: upgrade.cattle.io/v1
@@ -180,7 +228,7 @@ metadata:
   namespace: system-upgrade
 spec:
   concurrency: 1
-  version: v1.37.1+k3s1 # desired k3s release
+  channel: https://update.k3s.io/v1-release/channels/v1.36 # minor-pinned, never stable/latest
   serviceAccountName: system-upgrade
   cordon: true
   nodeSelector:
@@ -190,8 +238,19 @@ spec:
     image: rancher/k3s-upgrade
 ```
 
-Keep the k3s version within Rancher's supported Kubernetes range (see the support matrix), and upgrade Rancher itself 
-separately via `helm upgrade` on the `rancher` release.
+This keeps k3s current on **patches** without ever crossing a minor. That distinction matters:
+Rancher's chart declares an upper Kubernetes bound (the 2.16 head charts use
+`kubeVersion: < 1.37.0-0`). The `stable` and `latest` channels sit inside that bound today but will
+move to the next minor, and if the controller took the node across it the running Rancher would keep
+working while the **next `helm upgrade` was silently refused** — blocking every future Rancher bump.
+A `vX.Y` channel tracks patches within the minor and cannot cross it.
+
+No Plan is written when the k3s version is unpinned (`--rancher-repo alpha`/`--devel` without
+`--k3s-version`), since there is no minor to pin to.
+
+Moving to a new minor is a deliberate act: bump `default_k3s_version` for the Rancher minor, and
+re-point or replace the Plan's channel. Upgrade Rancher itself separately via `helm upgrade` on the
+`rancher` release.
 
 ## AWS permissions
 
@@ -200,6 +259,10 @@ The IAM principal running `roa` needs at minimum:
 - `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:TerminateInstances`
 - `ec2:CreateSecurityGroup`, `ec2:DeleteSecurityGroup`, `ec2:DescribeSecurityGroups`, `ec2:AuthorizeSecurityGroupIngress`
 - `route53:ChangeResourceRecordSets`, `route53:GetChange`
+
+`maintain` additionally needs:
+
+- `ec2:DescribeSnapshots`
 
 ## Local state
 

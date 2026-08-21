@@ -526,12 +526,25 @@ pub fn newest_head_chart(index: &str, minor: &str) -> Result<Option<ChartEntry>,
         .cloned())
 }
 
-// `rancher-2.16.0-<sha>-head` -> `2.16`
+// `rancher-2.16.0-<sha>-head` -> `2.16`, and `rancher-2.16-<sha>-head` -> `2.16`.
+//
+// The minor is truncated at the first non-digit because the pre-release repos publish both
+// shapes: most head charts are `<major>.<minor>.<patch>-<sha>-head`, but some carry no patch
+// component at all and the SHA runs straight into the minor. Splitting on `.` alone hands back
+// the whole SHA-bearing string, which then matches no chart in the index.
 fn chart_minor(chart: &str) -> Option<String> {
     let version = chart.strip_prefix("rancher-")?;
     let mut parts = version.split('.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
+
+    let major = parts
+        .next()
+        .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))?;
+
+    let minor: String = parts.next()?.chars().take_while(char::is_ascii_digit).collect();
+    if minor.is_empty() {
+        return None;
+    }
+
     Some(format!("{}.{}", major, minor))
 }
 
@@ -886,6 +899,16 @@ entries:
         assert_eq!(chart_minor("rancher-2.16.0-9575c72-head").as_deref(), Some("2.16"));
         assert_eq!(chart_minor("rancher-2.14.3").as_deref(), Some("2.14"));
         assert_eq!(chart_minor("cert-manager-v1.16.3"), None);
+
+        // Published without a patch component -- the SHA runs straight into the minor.
+        assert_eq!(
+            chart_minor("rancher-2.16-ffbd1cc914559930ba6aaa03bc434ef32aefe490-head").as_deref(),
+            Some("2.16")
+        );
+
+        // Nothing numeric to read is not a minor.
+        assert_eq!(chart_minor("rancher-devel"), None);
+        assert_eq!(chart_minor("rancher-v2.16.0"), None);
     }
 
     #[test]

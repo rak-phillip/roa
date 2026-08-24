@@ -1,12 +1,19 @@
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::types::{IpPermission, IpRange};
+
+use crate::provision::PortMapping;
 use aws_sdk_route53 as route53;
 use route53::types::{Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType};
 use std::time::Duration;
 use aws_sdk_ec2::error::ProvideErrorMetadata;
 use tokio::time::sleep;
 
-pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Ingress for a new instance: SSH, Rancher's own two ports, and any extra ports
+/// the caller asked for.
+///
+/// Only the host side of a port mapping appears here -- that is the side the
+/// outside world connects to, and the only side a security group can express.
+pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str, extra_ports: &[PortMapping]) -> Result<String, Box<dyn std::error::Error>> {
     let security_group = client.create_security_group()
         .group_name(format!("roa-{}", name).to_string())
         .description("ROA: Rancher development security group")
@@ -43,13 +50,26 @@ pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str) -
         .ip_ranges(ip_range.clone())
         .build();
 
-    client.authorize_security_group_ingress()
+    let mut ingress = client.authorize_security_group_ingress()
         .group_id(&security_group_id)
         .ip_permissions(ssh)
         .ip_permissions(https)
-        .ip_permissions(http)
-        .send()
-        .await?;
+        .ip_permissions(http);
+
+    for mapping in extra_ports {
+        let port = i32::from(mapping.host());
+
+        ingress = ingress.ip_permissions(
+            IpPermission::builder()
+                .ip_protocol("tcp")
+                .from_port(port)
+                .to_port(port)
+                .ip_ranges(ip_range.clone())
+                .build()
+        );
+    }
+
+    ingress.send().await?;
 
     Ok(security_group_id)
 }

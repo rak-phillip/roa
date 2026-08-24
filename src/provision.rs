@@ -57,6 +57,76 @@ enum ProvisionMode {
     Docker,
 }
 
+/// A port to publish on the container and open in the security group.
+///
+/// `host` is the side the outside world reaches and so the side the security
+/// group governs; `container` is where it lands inside. They default to the
+/// same number, which is not merely a convenience: a NodePort has no way to
+/// learn that the host publishes it as something else, so anything reading the
+/// cluster to build a URL -- a UI extension, say -- can only be right when the
+/// two agree. Map them apart for anything that is not a NodePort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    host: u16,
+    container: u16,
+}
+
+impl PortMapping {
+    /// The side the outside world connects to, and so the side a security group
+    /// rule is written for.
+    pub fn host(&self) -> u16 {
+        self.host
+    }
+}
+
+/// Ports the instance already publishes or allows before any of these are added.
+/// SSH is in the security group but not published by the container.
+const RESERVED_HOST_PORTS: [u16; 3] = [22, 80, 443];
+
+fn parse_port_mapping(value: &str) -> Result<PortMapping, String> {
+    let (host, container) = value.split_once(':').unwrap_or((value, value));
+
+    let port = |side: &str, raw: &str| -> Result<u16, String> {
+        match raw.trim().parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!(
+                "`{}` is not a port number ({} side of `{}`)",
+                raw.trim(),
+                side,
+                value
+            )),
+            Ok(port) => Ok(port),
+        }
+    };
+
+    Ok(PortMapping {
+        host: port("host", host)?,
+        container: port("container", container)?,
+    })
+}
+
+/// The mappings actually worth acting on, in the order they were given.
+///
+/// Drops anything the instance already handles rather than passing it on: a
+/// duplicate security group rule is rejected outright by EC2, and a second
+/// `-p 443:...` stops the container from starting at all -- both of which would
+/// turn a harmless repeated flag into an instance with no Rancher on it.
+fn usable_ports(ports: &[PortMapping]) -> Vec<PortMapping> {
+    let mut seen: Vec<u16> = RESERVED_HOST_PORTS.to_vec();
+
+    ports
+        .iter()
+        .filter(|mapping| {
+            if seen.contains(&mapping.host) {
+                false
+            } else {
+                seen.push(mapping.host);
+                true
+            }
+        })
+        .copied()
+        .collect()
+}
+
 #[derive(Parser, Debug)]
 pub struct ProvisionArgs {
     #[arg(long = "name", help = "Instance name. Also used as the subdomain: `<name>.ui.rancher.space`")]
@@ -94,6 +164,15 @@ pub struct ProvisionArgs {
 
     #[arg(long, default_value = "rancher/rancher", help = "Docker image registry (Docker mode only)")]
     docker_registry: String,
+
+    #[arg(
+        long = "ports",
+        value_name = "PORT[:CONTAINER_PORT]",
+        value_delimiter = ',',
+        value_parser = parse_port_mapping,
+        help = "Extra ports to open in the security group, and to publish on the container in Docker mode -- an ingress controller's NodePort, say. Comma-separated and repeatable. `30443` publishes 30443 on both sides; `8080:80` maps host 8080 to container 80. Only applies to a group roa creates; an existing --security-group-id is left alone"
+    )]
+    ports: Vec<PortMapping>,
 
     #[arg(long, help = "Override the Rancher hostname")]
     rancher_hostname: Option<String>,
@@ -243,9 +322,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
                 .as_deref()
                 .unwrap_or("head");
 
-            &*include_str!("../user-data-docker")
-                .replace("\"<DOCKER_REGISTRY>\"", &args.docker_registry)
-                .replace("\"<RANCHER_VERSION>\"", version)
+            &*render_docker_user_data(&args.docker_registry, version, &args.ports)
         },
     };
     let user_data = general_purpose::STANDARD.encode(user_data_script);
@@ -273,7 +350,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let security_group_id = match args.security_group_id {
         Some(id) => id,
-        None => create_security_group(&client, &args.vpc_id, &args.name).await?,
+        None => create_security_group(&client, &args.vpc_id, &args.name, &usable_ports(&args.ports)).await?,
     };
 
     let network_interface = InstanceNetworkInterfaceSpecification::builder()
@@ -389,6 +466,25 @@ async fn wait_for_rancher(url: &str, timeout: Duration) -> Result<(), Box<dyn st
     Err(format!("Rancher did not become ready at {}", url).into())
 }
 
+/// Render the docker-mode cloud-init, publishing any extra ports asked for.
+///
+/// The `-p` lines are generated rather than templated because there can be any
+/// number of them, and the placeholder is consumed *with its own line* -- an
+/// empty replacement that left a blank line behind would end the
+/// backslash-continued `docker run` early, and the instance would come up with
+/// no Rancher on it at all.
+fn render_docker_user_data(registry: &str, version: &str, ports: &[PortMapping]) -> String {
+    let publishes = usable_ports(ports)
+        .iter()
+        .map(|mapping| format!("  -p {}:{} \\\n", mapping.host, mapping.container))
+        .collect::<String>();
+
+    include_str!("../user-data-docker")
+        .replace("\"<DOCKER_REGISTRY>\"", registry)
+        .replace("\"<RANCHER_VERSION>\"", version)
+        .replace("  \"<EXTRA_PORTS>\"\n", &publishes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +528,94 @@ mod tests {
         assert!(!plan.contains("channels/latest"));
         assert!(plan.contains("namespace: system-upgrade"));
         assert!(plan.contains("image: rancher/k3s-upgrade"));
+    }
+
+    fn mapping(spec: &str) -> PortMapping {
+        parse_port_mapping(spec).expect("a port mapping")
+    }
+
+    #[test]
+    fn a_bare_port_maps_to_itself() {
+        // The form a NodePort has to take: it cannot see the host's mapping, so
+        // only matching numbers let a URL built from the cluster work.
+        assert_eq!(mapping("30443"), PortMapping { host: 30443, container: 30443 });
+        assert_eq!(mapping(" 30443 "), PortMapping { host: 30443, container: 30443 });
+    }
+
+    #[test]
+    fn a_pair_maps_host_to_container() {
+        assert_eq!(mapping("8080:80"), PortMapping { host: 8080, container: 80 });
+    }
+
+    #[test]
+    fn refuses_anything_that_is_not_a_port() {
+        for spec in ["", "0", "http", "8080:", "8080:0", ":80", "70000", "8080:https"] {
+            assert!(parse_port_mapping(spec).is_err(), "{} parsed", spec);
+        }
+    }
+
+    #[test]
+    fn drops_ports_the_instance_already_handles() {
+        // A repeated rule is rejected by EC2 outright, and a second `-p 443:...`
+        // stops the container starting -- so a duplicate must never reach either.
+        let asked = vec![
+            mapping("443"),
+            mapping("30443"),
+            mapping("30443"),
+            mapping("22"),
+            mapping("80:8080"),
+            mapping("8080:80"),
+        ];
+
+        assert_eq!(usable_ports(&asked), vec![mapping("30443"), mapping("8080:80")]);
+    }
+
+    #[test]
+    fn docker_user_data_publishes_only_rancher_by_default() {
+        let script = render_docker_user_data("rancher/rancher", "head", &[]);
+
+        assert!(script.contains("-p 80:80"));
+        assert!(script.contains("-p 443:443"));
+        assert!(!script.contains("<EXTRA_PORTS>"));
+        // The placeholder took its own line with it, so the run stays one
+        // continued command. A blank line here would truncate it at :443.
+        assert!(script.contains("  -p 443:443 \\\n  -e CATTLE_BOOTSTRAP_PASSWORD"));
+    }
+
+    #[test]
+    fn docker_user_data_publishes_every_port_asked_for() {
+        let script = render_docker_user_data(
+            "rancher/rancher",
+            "head",
+            &[mapping("30443"), mapping("8080:80")],
+        );
+
+        assert!(script.contains("  -p 30443:30443 \\\n"));
+        assert!(script.contains("  -p 8080:80 \\\n"));
+        assert!(script.contains("  -p 443:443 \\\n  -p 30443:30443"));
+        assert!(script.contains("-e CATTLE_BOOTSTRAP_PASSWORD"));
+    }
+
+    #[test]
+    fn docker_user_data_never_leaves_a_blank_line_in_the_run() {
+        for ports in [vec![], vec![mapping("30443")]] {
+            let script = render_docker_user_data("rancher/rancher", "head", &ports);
+            let run = script
+                .split("sudo docker run -d")
+                .nth(1)
+                .expect("a docker run block");
+            let block: Vec<&str> = run
+                .lines()
+                .take_while(|line| line.ends_with('\\') || line.contains("--privileged"))
+                .collect();
+
+            assert!(
+                block.iter().all(|line| !line.trim().is_empty()),
+                "blank line inside the docker run for {:?}",
+                ports
+            );
+            assert!(block.last().expect("a last line").contains("--privileged"));
+        }
     }
 
     #[test]

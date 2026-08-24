@@ -95,6 +95,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
 | `--docker-registry` | `rancher/rancher` | Docker image registry (Docker mode only) |
+| `--ports` | *(none)* | Extra ports to open in the security group, and publish on the container in Docker mode. Comma-separated and repeatable |
 | `--wait-for-ready` | `false` | Block until DNS propagates and Rancher is reachable |
 
 **Example:**
@@ -106,6 +107,48 @@ roa provision \
   --email admin@example.com \
   --wait-for-ready
 ```
+
+#### Opening extra ports
+
+An instance allows `22`, `80` and `443`, and a Docker-mode container publishes `80` and `443`.
+Anything else needs `--ports`, which opens the port in the security group and — in Docker mode —
+publishes it on the container:
+
+```bash
+roa provision --name my-rancher --ports 30443
+roa provision --name my-rancher --ports 30443,9090 --ports 8080:80
+```
+
+Each value is either a bare port, published and opened under the **same number on both sides**, or a
+`HOST:CONTAINER` pair. Ports the instance already handles are dropped rather than passed on: EC2
+rejects a duplicate rule outright, and a second `-p 443:...` stops the container from starting at all.
+
+`--ports` applies only to a security group `roa` creates. Pass `--security-group-id` and the ports in
+that group are its owner's business.
+
+##### Giving a Docker-mode cluster an ingress controller
+
+The case this was built for. A Docker Rancher's embedded k3s starts with traefik and servicelb
+disabled, so the cluster has no ingress controller — and the container's `443` belongs to the Rancher
+server process, so one installed there could not receive traffic anyway. Publish a NodePort for it:
+
+```bash
+roa provision \
+  --name ingress-test \
+  --mode docker \
+  --key-name my-keypair \
+  --email admin@example.com \
+  --ports 30443
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.service.type=NodePort \
+  --set controller.service.nodePorts.https=30443
+```
+
+Use the bare form for a NodePort, never a `HOST:CONTAINER` pair. A NodePort has no way to learn that
+the host publishes it as some other port, so `8443:30443` would leave anything that reads the cluster
+to build a URL — a UI extension, a script — with no way to be right.
 
 ### `terminate` — Terminate a Rancher instance
 

@@ -159,6 +159,9 @@ pub struct ProvisionArgs {
     #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
     rancher_repo: RancherRepo,
 
+    #[arg(long, default_value_t = false, help = "Mark the instance protected so `terminate` refuses it without --force")]
+    protect: bool,
+
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
     rancher_version: Option<String>,
 
@@ -402,6 +405,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         security_group_id,
         region,
         rancher_repo: Some(rancher_repo.to_string()),
+        protected: args.protect,
     };
 
     let manifest_path = manifest_path();

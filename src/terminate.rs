@@ -8,7 +8,7 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
 use clap::{Parser};
 use tokio::time::sleep;
-use crate::instance::{load_instances, manifest_path, save_instances};
+use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 
 #[derive(Parser, Debug)]
 pub struct TerminateArgs {
@@ -20,9 +20,33 @@ pub struct TerminateArgs {
 
     #[arg(long, env = "ROA_VPC_ID", help = "VPC used to locate the security group for deletion", hide_env = true)]
     vpc_id: String,
+
+    #[arg(long, default_value_t = false, help = "Terminate even if the instance is marked protected in the manifest")]
+    force: bool,
+}
+
+pub fn termination_blocked(instances: &[Instance], instance_id: &str, force: bool) -> bool {
+    !force && instances.iter().any(|i| i.instance_id == instance_id && i.protected)
 }
 
 pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = manifest_path();
+    let instances = load_instances(&manifest_path)?;
+
+    if termination_blocked(&instances, &args.instance_id, args.force) {
+        let name = instances
+            .iter()
+            .find(|i| i.instance_id == args.instance_id)
+            .map(|i| i.name.as_str())
+            .unwrap_or("<unknown>");
+
+        return Err(format!(
+            "{} ({}) is marked protected in the manifest. Re-run with --force to terminate it anyway.",
+            args.instance_id, name
+        )
+        .into());
+    }
+
     let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
@@ -70,9 +94,7 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
         }
     }
 
-    let manifest_path = manifest_path();
-
-    let mut instances = load_instances(&manifest_path)?;
+    let mut instances = instances;
     let removed_idx = instances
         .iter()
         .position(|instance| instance.instance_id == args.instance_id);
@@ -189,4 +211,59 @@ async fn delete_security_group(ec2: &aws_sdk_ec2::Client, vpc_id: &str, group_na
         }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(id: &str, name: &str, protected: bool) -> Instance {
+        Instance {
+            instance_id: id.to_string(),
+            name: name.to_string(),
+            public_ip: "203.0.113.1".to_string(),
+            fqdn: format!("{}.ui.rancher.space", name),
+            security_group_id: "sg-0".to_string(),
+            hosted_zone_id: "Z0".to_string(),
+            region: "us-west-2".to_string(),
+            created_at: "2026-08-13 21:46:39 UTC".to_string(),
+            rancher_repo: None,
+            protected,
+        }
+    }
+
+    #[test]
+    fn protected_instance_is_blocked() {
+        let instances = vec![instance("i-shared", "shared", true)];
+        assert!(termination_blocked(&instances, "i-shared", false));
+    }
+
+    #[test]
+    fn force_overrides_protection() {
+        let instances = vec![instance("i-shared", "shared", true)];
+        assert!(!termination_blocked(&instances, "i-shared", true));
+    }
+
+    #[test]
+    fn unprotected_instance_is_not_blocked() {
+        let instances = vec![instance("i-throwaway", "prak-throwaway", false)];
+        assert!(!termination_blocked(&instances, "i-throwaway", false));
+    }
+
+    #[test]
+    fn instance_absent_from_manifest_is_not_blocked() {
+        // The guard defends what roa records and nothing else. Keeping this as a test rather than
+        // a comment so the limitation cannot be quietly forgotten.
+        let instances = vec![instance("i-shared", "shared", true)];
+        assert!(!termination_blocked(&instances, "i-unknown", false));
+    }
+
+    #[test]
+    fn protection_is_matched_by_id_not_name() {
+        let instances = vec![
+            instance("i-shared", "shared", true),
+            instance("i-throwaway", "shared-old-k3d", false),
+        ];
+        assert!(!termination_blocked(&instances, "i-throwaway", false));
+    }
 }

@@ -12,11 +12,12 @@ pub async fn list(_args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
 
    for i in instances {
       println!(
-         "{} {} {} {}",
+         "{} {} {} {}{}",
          i.instance_id,
          i.name,
          i.public_ip,
          i.fqdn,
+         if i.protected { "  [PROTECTED]" } else { "" },
       );
    }
 

@@ -96,6 +96,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
 | `--docker-registry` | `rancher/rancher` | Docker image registry (Docker mode only) |
 | `--ports` | *(none)* | Extra ports to open in the security group, and publish on the container in Docker mode. Comma-separated and repeatable |
+| `--protect` | `false` | Mark the instance protected, so `terminate` refuses it without `--force` |
 | `--wait-for-ready` | `false` | Block until DNS propagates and Rancher is reachable |
 
 **Example:**
@@ -166,11 +167,35 @@ roa terminate --instance-id <INSTANCE_ID> [OPTIONS]
 | `--hosted-zone-id` | `ROA_HOSTED_ZONE_ID` | Route 53 hosted zone containing the DNS record |
 | `--vpc-id` | `ROA_VPC_ID` | VPC used to locate the security group for deletion |
 
+**Optional flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--force` | `false` | Terminate even if the instance is marked protected in the manifest |
+
 **Example:**
 
 ```bash
 roa terminate --instance-id i-0123456789abcdef0
 ```
+
+#### Protected instances
+
+A long-lived instance among a pile of throwaways is one hasty copy-paste away from being torn down.
+Mark it at launch with `roa provision --protect`, or set `"protected": true` on its manifest entry,
+and `terminate` refuses it:
+
+```
+$ roa terminate --instance-id i-0bbed900e95569f45
+Error: "i-0bbed900e95569f45 (shared) is marked protected in the manifest. Re-run with --force to terminate it anyway."
+```
+
+`roa list` marks protected entries so they are visible in the list an ID gets copied out of.
+
+**The guard only reaches instances the manifest records.** `terminate` acts on the `--instance-id`
+it is given, so an instance left out of the manifest is not protected by its absence — it is simply
+out of the guard's reach. Keeping a long-lived instance recorded *and* protected is the safe
+arrangement; leaving it unrecorded is not.
 
 ### `list` — List provisioned instances
 
@@ -180,12 +205,14 @@ Displays all instances recorded in the local manifest (`~/.config/roa/instances.
 roa list
 ```
 
-**Output columns:** `instance_id  name  public_ip  fqdn`
+**Output columns:** `instance_id  name  public_ip  fqdn`, plus a trailing `[PROTECTED]` marker on
+instances `terminate` will refuse without `--force`.
 
 **Example output:**
 
 ```
 i-0123456789abcdef0  my-rancher  203.0.113.42  my-rancher.ui.rancher.space
+i-0bbed900e95569f45  shared      203.0.113.9   shared.ui.rancher.space  [PROTECTED]
 ```
 
 ### `maintain` — Weekly health report

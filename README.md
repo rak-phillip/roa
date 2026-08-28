@@ -97,6 +97,8 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--docker-registry` | `rancher/rancher` | Docker image registry (Docker mode only) |
 | `--ports` | *(none)* | Extra ports to open in the security group, and publish on the container in Docker mode. Comma-separated and repeatable |
 | `--protect` | `false` | Mark the instance protected, so `terminate` refuses it without `--force` |
+| `--ssh-cidr` | `0.0.0.0/0` | CIDR allowed to reach SSH. Only scopes port 22 — 80 and 443 stay open |
+| `--ssm-profile` | *(none)* | Existing IAM instance profile to attach at launch, for SSM Session Manager access |
 | `--wait-for-ready` | `false` | Block until DNS propagates and Rancher is reachable |
 
 **Example:**
@@ -107,6 +109,37 @@ roa provision \
   --key-name my-keypair \
   --email admin@example.com \
   --wait-for-ready
+```
+
+#### Hardening SSH
+
+Every instance is born with an sshd drop-in at `/etc/ssh/sshd_config.d/50-roa-hardening.conf`
+setting `PermitRootLogin no`, `X11Forwarding no`, `AllowAgentForwarding no` and `LogLevel VERBOSE`.
+`user-data` validates it with `sshd -t` and then `reload`s — never `restart` — so a bad config
+fails the reload instead of locking the instance out.
+
+`AllowTcpForwarding` is deliberately **not** set. k3s serves the API on 6443 and the kubelet on
+10250, neither open in the security group, so `ssh -L 6443:localhost:6443` is a legitimate way to
+reach the cluster and disabling forwarding would break it silently. `LogLevel VERBOSE` records
+`direct-tcpip` channel opens, so whether anything actually forwards can be settled with evidence:
+
+```bash
+sudo journalctl -u ssh --since "7 days ago" | grep -c direct-tcpip
+```
+
+The control that actually reduces exposure is `--ssh-cidr`. The default of `0.0.0.0/0` is fine for
+a throwaway and wrong for anything long-lived:
+
+```bash
+roa provision --name long-lived --ssh-cidr 203.0.113.7/32 --ssm-profile my-ssm-profile
+```
+
+Pair it with `--ssm-profile` so there is a way back in when the address changes. roa never creates
+the IAM profile — it only attaches one that already exists — which keeps it out of IAM entirely.
+With a profile attached at launch, the SSM agent Ubuntu already ships registers on first boot:
+
+```bash
+aws ssm start-session --target <instance-id>
 ```
 
 #### Opening extra ports

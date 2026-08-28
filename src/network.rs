@@ -13,7 +13,7 @@ use tokio::time::sleep;
 ///
 /// Only the host side of a port mapping appears here -- that is the side the
 /// outside world connects to, and the only side a security group can express.
-pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str, extra_ports: &[PortMapping]) -> Result<String, Box<dyn std::error::Error>> {
+pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str, extra_ports: &[PortMapping], ssh_cidr: &str) -> Result<String, Box<dyn std::error::Error>> {
     let security_group = client.create_security_group()
         .group_name(format!("roa-{}", name).to_string())
         .description("ROA: Rancher development security group")
@@ -33,7 +33,7 @@ pub async fn create_security_group( client: &Client, vpc_id: &str, name: &str, e
         .ip_protocol("tcp")
         .from_port(22)
         .to_port(22)
-        .ip_ranges(ip_range.clone())
+        .ip_ranges(IpRange::builder().cidr_ip(ssh_cidr).build())
         .build();
 
     let http = IpPermission::builder()

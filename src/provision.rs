@@ -2,7 +2,7 @@ use std::time::Duration;
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ec2::Client;
-use aws_sdk_ec2::types::{BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
+use aws_sdk_ec2::types::{IamInstanceProfileSpecification, BlockDeviceMapping, EbsBlockDevice, Tag, TagSpecification, InstanceNetworkInterfaceSpecification, InstanceType};
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
@@ -83,6 +83,24 @@ impl PortMapping {
 /// SSH is in the security group but not published by the container.
 const RESERVED_HOST_PORTS: [u16; 3] = [22, 80, 443];
 
+fn parse_cidr(value: &str) -> Result<String, String> {
+    let value = value.trim();
+
+    let (addr, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| format!("`{}` is not a CIDR -- it needs a prefix length, e.g. `{}/32`", value, value))?;
+
+    let octets: Vec<&str> = addr.split('.').collect();
+    if octets.len() != 4 || !octets.iter().all(|o| !o.is_empty() && o.parse::<u8>().is_ok()) {
+        return Err(format!("`{}` is not a dotted-quad IPv4 address in `{}`", addr, value));
+    }
+
+    match prefix.parse::<u8>() {
+        Ok(bits) if bits <= 32 => Ok(value.to_string()),
+        _ => Err(format!("`{}` is not a prefix length between 0 and 32 in `{}`", prefix, value)),
+    }
+}
+
 fn parse_port_mapping(value: &str) -> Result<PortMapping, String> {
     let (host, container) = value.split_once(':').unwrap_or((value, value));
 
@@ -161,6 +179,17 @@ pub struct ProvisionArgs {
 
     #[arg(long, default_value_t = false, help = "Mark the instance protected so `terminate` refuses it without --force")]
     protect: bool,
+
+    #[arg(
+        long,
+        default_value = "0.0.0.0/0",
+        value_parser = parse_cidr,
+        help = "CIDR allowed to reach SSH. Defaults to anywhere, which is fine for a throwaway and wrong for anything long-lived -- pass your own address as `A.B.C.D/32`. Only scopes port 22; 80 and 443 stay open"
+    )]
+    ssh_cidr: String,
+
+    #[arg(long, help = "Existing IAM instance profile to attach at launch, e.g. for SSM Session Manager access. roa never creates the profile -- it only attaches one you already made")]
+    ssm_profile: Option<String>,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
     rancher_version: Option<String>,
@@ -353,7 +382,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
 
     let security_group_id = match args.security_group_id {
         Some(id) => id,
-        None => create_security_group(&client, &args.vpc_id, &args.name, &usable_ports(&args.ports)).await?,
+        None => create_security_group(&client, &args.vpc_id, &args.name, &usable_ports(&args.ports), &args.ssh_cidr).await?,
     };
 
     let network_interface = InstanceNetworkInterfaceSpecification::builder()
@@ -363,7 +392,7 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .device_index(0)
         .build();
 
-    let resp = client
+    let mut run = client
         .run_instances()
         .image_id(args.ami_id)
         .instance_type(InstanceType::T32xlarge)
@@ -373,9 +402,16 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .user_data(user_data)
         .network_interfaces(network_interface)
         .block_device_mappings(block_device)
-        .tag_specifications(tag_spec)
-        .send()
-        .await?;
+        .tag_specifications(tag_spec);
+
+    if let Some(profile) = &args.ssm_profile {
+        println!("Attaching IAM instance profile: {}", profile);
+        run = run.iam_instance_profile(
+            IamInstanceProfileSpecification::builder().name(profile).build(),
+        );
+    }
+
+    let resp = run.send().await?;
 
     let instance_id = resp.instances()
         .first()
@@ -620,6 +656,53 @@ mod tests {
             );
             assert!(block.last().expect("a last line").contains("--privileged"));
         }
+    }
+
+    #[test]
+    fn a_cidr_needs_a_prefix_length() {
+        assert!(parse_cidr("68.104.236.252").is_err());
+    }
+
+    #[test]
+    fn a_valid_cidr_round_trips() {
+        assert_eq!(parse_cidr("68.104.236.252/32").unwrap(), "68.104.236.252/32");
+        assert_eq!(parse_cidr("0.0.0.0/0").unwrap(), "0.0.0.0/0");
+        assert_eq!(parse_cidr("10.0.0.0/8").unwrap(), "10.0.0.0/8");
+    }
+
+    #[test]
+    fn refuses_a_prefix_wider_than_the_address_space() {
+        assert!(parse_cidr("10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn refuses_something_that_is_not_an_address() {
+        assert!(parse_cidr("my-house/32").is_err());
+        assert!(parse_cidr("10.0.0/24").is_err());
+        assert!(parse_cidr("999.0.0.1/32").is_err());
+    }
+
+    #[test]
+    fn user_data_hardens_sshd_and_validates_before_reloading() {
+        let rendered = include_str!("../user-data");
+
+        assert!(rendered.contains("PermitRootLogin no"));
+        assert!(rendered.contains("X11Forwarding no"));
+        assert!(rendered.contains("AllowAgentForwarding no"));
+        // The validate-then-reload pair is the part that keeps a bad drop-in from locking the
+        // instance out, so assert the ordering rather than just the presence of each half.
+        assert!(rendered.contains("sudo sshd -t && sudo systemctl reload ssh"));
+        // Deliberately unset -- see the comment in user-data. The comment names the directive, so
+        // check no *active* line sets it rather than that the word is absent. A future change
+        // flipping this on has to update this test, and read why it was left alone.
+        assert!(
+            !rendered
+                .lines()
+                .any(|l| l.trim_start().starts_with("AllowTcpForwarding")),
+            "AllowTcpForwarding is set as a directive; it is meant to stay unset pending evidence"
+        );
+        // Applied as a heredoc; an unbalanced marker would break provisioning.
+        assert_eq!(rendered.matches("SSHEOF").count(), 2);
     }
 
     #[test]

@@ -1,0 +1,30 @@
+# sshd hardening. Written as a drop-in because /etc/ssh/sshd_config Includes sshd_config.d/*.conf
+# near the top of the file and sshd is first-match-wins, so these win over the defaults below it.
+sudo tee /etc/ssh/sshd_config.d/50-roa-hardening.conf > /dev/null <<'SSHEOF'
+# Nothing logs in as root over ssh on a roa instance -- `roa maintain` uses `ubuntu`, and work
+# needing root goes through sudo once you are on the box.
+PermitRootLogin no
+
+# No display is ever forwarded from a headless server.
+X11Forwarding no
+
+# Agent forwarding lets whoever holds root here use your local keys against every other host you
+# can reach. A cluster box other people share is exactly where that matters.
+AllowAgentForwarding no
+
+# AllowTcpForwarding is deliberately NOT set, and that is a decision rather than an omission.
+# k3s serves the API on 6443 and the kubelet on 10250, neither open in the security group, so
+# `ssh -L 6443:localhost:6443` is a legitimate way to reach the cluster. Disabling it would break
+# that silently. LogLevel VERBOSE below records direct-tcpip channel opens, so the question can be
+# settled with evidence on a box that has run for a while.
+#
+# Scope port 22 with `roa provision --ssh-cidr` -- that is the control that actually reduces
+# exposure here.
+
+# INFO does not log port-forwarding channel opens at all. VERBOSE does.
+LogLevel VERBOSE
+SSHEOF
+
+# Validate before reloading: a bad config plus a reload is a lockout. `reload` re-execs sshd
+# without dropping established sessions; `restart` is not needed and is riskier.
+sudo sshd -t && sudo systemctl reload ssh

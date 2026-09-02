@@ -83,8 +83,57 @@ impl PortMapping {
 /// SSH is in the security group but not published by the container.
 const RESERVED_HOST_PORTS: [u16; 3] = [22, 80, 443];
 
+// The `--ssh-cidr` value that means "wherever I am right now".
+const SSH_CIDR_SELF: &str = "self";
+
+// Resolves `self` to the caller's current public address as a /32; passes anything else through
+// unchanged, since `parse_cidr` has already validated it.
+//
+// A literal /32 written into `roa_variables` rots the first time a residential address rotates,
+// and it rots silently -- the next instance comes up with a rule that admits nobody, which reads
+// as a broken box rather than a stale rule. Resolving at provision time keeps the scoped choice
+// the cheap one to make.
+async fn resolve_ssh_cidr(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if !value.eq_ignore_ascii_case(SSH_CIDR_SELF) {
+        return Ok(value.to_string());
+    }
+
+    let body = reqwest::Client::new()
+        .get("https://checkip.amazonaws.com")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let cidr = format!("{}/32", body.trim());
+    parse_cidr(&cidr).map_err(|e| format!("checkip.amazonaws.com did not return an address: {}", e))?;
+
+    println!("Scoping SSH to {}", cidr);
+    Ok(cidr)
+}
+
+// Substitutes the sshd drop-in into a cloud-init template.
+//
+// Shared by both modes because how exposed sshd is has nothing to do with whether Rancher arrives
+// by Helm or by Docker -- the two templates drifting apart is exactly how `--mode docker` came to
+// hand out an instance running stock sshd. The placeholder is consumed with its own line so the
+// snippet starts at column zero.
+fn render_sshd_hardening(template: &str) -> String {
+    template.replace(
+        "\"<SSHD_HARDENING>\"\n",
+        include_str!("../user-data-sshd-hardening"),
+    )
+}
+
 fn parse_cidr(value: &str) -> Result<String, String> {
     let value = value.trim();
+
+    // Resolved at provision time rather than here: parsing runs once per process, but the address
+    // it would bake in outlives the process in `roa_variables`.
+    if value.eq_ignore_ascii_case(SSH_CIDR_SELF) {
+        return Ok(SSH_CIDR_SELF.to_string());
+    }
 
     let (addr, prefix) = value
         .split_once('/')
@@ -182,13 +231,15 @@ pub struct ProvisionArgs {
 
     #[arg(
         long,
+        env = "ROA_SSH_CIDR",
+        hide_env = true,
         default_value = "0.0.0.0/0",
         value_parser = parse_cidr,
-        help = "CIDR allowed to reach SSH. Defaults to anywhere, which is fine for a throwaway and wrong for anything long-lived -- pass your own address as `A.B.C.D/32`. Only scopes port 22; 80 and 443 stay open"
+        help = "CIDR allowed to reach SSH, or `self` for your current public address as a /32. Defaults to anywhere, which is fine for a throwaway and wrong for anything long-lived. Only scopes port 22; 80 and 443 stay open"
     )]
     ssh_cidr: String,
 
-    #[arg(long, help = "Existing IAM instance profile to attach at launch, e.g. for SSM Session Manager access. roa never creates the profile -- it only attaches one you already made")]
+    #[arg(long, env = "ROA_SSM_PROFILE", hide_env = true, help = "Existing IAM instance profile to attach at launch, e.g. for SSM Session Manager access. roa never creates the profile -- it only attaches one you already made")]
     ssm_profile: Option<String>,
 
     #[arg(long, help = "Pin a specific Rancher version (e.g. `v2.14.0`)")]
@@ -340,8 +391,8 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         }
     };
 
-    let user_data_script = match args.mode {
-        ProvisionMode::Helm => &*include_str!("../user-data")
+    let user_data_script = render_sshd_hardening(&match args.mode {
+        ProvisionMode::Helm => include_str!("../user-data")
             .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
@@ -354,9 +405,9 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
                 .as_deref()
                 .unwrap_or("head");
 
-            &*render_docker_user_data(&args.docker_registry, version, &args.ports)
+            render_docker_user_data(&args.docker_registry, version, &args.ports)
         },
-    };
+    });
     let user_data = general_purpose::STANDARD.encode(user_data_script);
 
     let block_device = BlockDeviceMapping::builder()
@@ -375,14 +426,25 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         .value(args.name.clone())
         .build();
 
+    // What an IAM policy scopes against. `ssm:StartSession` cannot be granted on "every instance
+    // roa will ever make" by ARN, but it can be granted on a resource tag -- so one policy covers
+    // instances that do not exist yet, instead of an edit per box.
+    let managed_by_tag = Tag::builder()
+        .key("ManagedBy")
+        .value("roa")
+        .build();
+
     let tag_spec = TagSpecification::builder()
         .resource_type(aws_sdk_ec2::types::ResourceType::Instance)
         .tags(name_tag)
+        .tags(managed_by_tag)
         .build();
+
+    let ssh_cidr = resolve_ssh_cidr(&args.ssh_cidr).await?;
 
     let security_group_id = match args.security_group_id {
         Some(id) => id,
-        None => create_security_group(&client, &args.vpc_id, &args.name, &usable_ports(&args.ports), &args.ssh_cidr).await?,
+        None => create_security_group(&client, &args.vpc_id, &args.name, &usable_ports(&args.ports), &ssh_cidr).await?,
     };
 
     let network_interface = InstanceNetworkInterfaceSpecification::builder()
@@ -684,7 +746,8 @@ mod tests {
 
     #[test]
     fn user_data_hardens_sshd_and_validates_before_reloading() {
-        let rendered = include_str!("../user-data");
+        let rendered = render_sshd_hardening(include_str!("../user-data"));
+        let rendered = rendered.as_str();
 
         assert!(rendered.contains("PermitRootLogin no"));
         assert!(rendered.contains("X11Forwarding no"));
@@ -726,5 +789,46 @@ mod tests {
         let without_plan = template.replace("\"<K3S_UPGRADE_PLAN>\"", "");
         assert!(!without_plan.contains("kind: Plan"));
         assert!(!without_plan.contains("<K3S_UPGRADE_PLAN>"));
+    }
+
+    #[test]
+    fn both_modes_are_born_with_the_same_hardened_sshd() {
+        // Docker mode shipped without any hardening at all until the drop-in was pulled out of the
+        // Helm template, so assert the two modes agree rather than that each contains the text.
+        let helm = render_sshd_hardening(include_str!("../user-data"));
+        let docker = render_sshd_hardening(&render_docker_user_data("rancher/rancher", "head", &[]));
+
+        for script in [&helm, &docker] {
+            assert!(script.contains("PermitRootLogin no"));
+            assert!(script.contains("X11Forwarding no"));
+            assert!(script.contains("AllowAgentForwarding no"));
+            assert!(script.contains("LogLevel VERBOSE"));
+            assert!(script.contains("sudo sshd -t && sudo systemctl reload ssh"));
+            // An unsubstituted placeholder would reach the box as a bare quoted string and abort
+            // the script under `set -e`.
+            assert!(!script.contains("<SSHD_HARDENING>"));
+            assert_eq!(script.matches("SSHEOF").count(), 2);
+        }
+    }
+
+    #[test]
+    fn every_template_carries_the_hardening_placeholder() {
+        // A new cloud-init template that forgets the placeholder is the failure this guards: it
+        // provisions fine and quietly hands out stock sshd.
+        assert!(include_str!("../user-data").contains("\"<SSHD_HARDENING>\""));
+        assert!(include_str!("../user-data-docker").contains("\"<SSHD_HARDENING>\""));
+    }
+
+    #[test]
+    fn self_survives_cidr_validation() {
+        assert_eq!(parse_cidr("self").unwrap(), "self");
+        assert_eq!(parse_cidr("  SELF  ").unwrap(), "self");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_literal_cidr_asks_nobody() {
+        // Only `self` is worth a network round trip; anything else is already an address.
+        assert_eq!(resolve_ssh_cidr("68.104.236.252/32").await.unwrap(), "68.104.236.252/32");
+        assert_eq!(resolve_ssh_cidr("0.0.0.0/0").await.unwrap(), "0.0.0.0/0");
     }
 }

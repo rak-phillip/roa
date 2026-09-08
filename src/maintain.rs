@@ -1,17 +1,15 @@
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::time::Duration;
 
-use aws_config::meta::region::RegionProviderChain;
-use aws_config::{BehaviorVersion, Region};
-use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ec2::types::Filter;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use crate::aws::{ec2_client, root_volume_id};
 use crate::instance::{Instance, load_instances, manifest_path};
 use crate::provision::RancherRepo;
+use crate::ssh::{SshTarget, run_script, split_sections};
 
 const K3S_CHANNELS_URL: &str = "https://update.k3s.io/v1-release/channels";
 const SNAPSHOT_MAX_AGE_DAYS: i64 = 7;
@@ -227,75 +225,28 @@ echo '###end'
 "#;
 
 fn run_remote(instance: &Instance, args: &MaintainArgs) -> Result<String, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("ssh");
+    let target = SshTarget {
+        user: &args.ssh_user,
+        host: &instance.fqdn,
+        key: args.ssh_key.as_deref(),
+        // The report is one short batch; nothing here runs long enough to be reaped.
+        keepalive: false,
+    };
 
-    // Never block on a prompt: this is meant to be scriptable.
-    cmd.arg("-o").arg("BatchMode=yes")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new");
-
-    if let Some(key) = &args.ssh_key {
-        cmd.arg("-i").arg(key);
-    }
-
-    // The FQDN, not the manifest's public_ip -- the instance has no Elastic IP, so the
-    // recorded address goes stale across a stop/start while DNS stays authoritative.
-    cmd.arg(format!("{}@{}", args.ssh_user, instance.fqdn))
-        .arg("bash -s")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    {
-        use std::io::Write;
-        let stdin = child.stdin.as_mut().ok_or("failed to open ssh stdin")?;
-        stdin.write_all(REMOTE_SCRIPT.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let output = run_script(&target, REMOTE_SCRIPT)?;
 
     // The remote script only exits non-zero if ssh itself failed to connect; per-check
     // failures are already swallowed above.
-    if !output.status.success() && !stdout.contains("###end") {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
+    if !output.success && !output.stdout.contains("###end") {
+        return Err(if output.stderr.is_empty() {
             format!("ssh exited with {}", output.status)
         } else {
-            stderr
+            output.stderr
         }
         .into());
     }
 
-    Ok(stdout)
-}
-
-fn split_sections(output: &str) -> BTreeMap<String, String> {
-    let mut sections = BTreeMap::new();
-    let mut current: Option<String> = None;
-    let mut buffer = String::new();
-
-    for line in output.lines() {
-        if let Some(name) = line.strip_prefix("###") {
-            if let Some(key) = current.take() {
-                sections.insert(key, std::mem::take(&mut buffer));
-            }
-            if name != "end" {
-                current = Some(name.to_string());
-            }
-        } else if current.is_some() {
-            buffer.push_str(line);
-            buffer.push('\n');
-        }
-    }
-
-    if let Some(key) = current {
-        sections.insert(key, buffer);
-    }
-
-    sections
+    Ok(output.stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +483,7 @@ pub fn newest_head_chart(index: &str, minor: &str) -> Result<Option<ChartEntry>,
 // shapes: most head charts are `<major>.<minor>.<patch>-<sha>-head`, but some carry no patch
 // component at all and the SHA runs straight into the minor. Splitting on `.` alone hands back
 // the whole SHA-bearing string, which then matches no chart in the index.
-fn chart_minor(chart: &str) -> Option<String> {
+pub fn chart_minor(chart: &str) -> Option<String> {
     let version = chart.strip_prefix("rancher-")?;
     let mut parts = version.split('.');
 
@@ -751,37 +702,9 @@ async fn newest_snapshot(
 ) -> Result<Option<(String, DateTime<Utc>, String)>, Box<dyn std::error::Error>> {
     // Seed the region from the manifest so the report always targets the instance's region
     // rather than whatever the ambient AWS config happens to say.
-    let region_provider =
-        RegionProviderChain::default_provider().or_else(Region::new(instance.region.clone()));
+    let ec2 = ec2_client(&instance.region).await;
 
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-
-    let ec2 = Ec2Client::new(&config);
-
-    let described = ec2
-        .describe_instances()
-        .instance_ids(&instance.instance_id)
-        .send()
-        .await?;
-
-    let root_device = described
-        .reservations()
-        .first()
-        .and_then(|r| r.instances().first())
-        .ok_or_else(|| format!("instance {} not found", instance.instance_id))?;
-
-    let root_name = root_device.root_device_name().unwrap_or("/dev/sda1");
-
-    let volume_id = root_device
-        .block_device_mappings()
-        .iter()
-        .find(|m| m.device_name() == Some(root_name))
-        .and_then(|m| m.ebs())
-        .and_then(|e| e.volume_id())
-        .ok_or("could not resolve the root volume")?;
+    let volume_id = root_volume_id(&ec2, &instance.instance_id).await?;
 
     let snapshots = ec2
         .describe_snapshots()
@@ -934,17 +857,6 @@ entries:
         // A channel with no release yet must not blow up deserialization.
         let testing = channels.data.iter().find(|c| c.id == "testing").unwrap();
         assert_eq!(testing.latest, None);
-    }
-
-    #[test]
-    fn splits_the_batched_remote_output_into_sections() {
-        let output = "###apt\n191;137\n###reboot\nnone\n###k3s_version\nv1.36.3+k3s1\n\n###end\n";
-        let sections = split_sections(output);
-
-        assert_eq!(sections.get("apt").unwrap().trim(), "191;137");
-        assert_eq!(sections.get("reboot").unwrap().trim(), "none");
-        assert_eq!(sections.get("k3s_version").unwrap().trim(), "v1.36.3+k3s1");
-        assert!(!sections.contains_key("end"));
     }
 
     #[test]

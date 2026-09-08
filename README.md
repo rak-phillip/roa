@@ -296,6 +296,86 @@ Head charts are picked by **publish date**, never by semver — the pre-release 
 Rancher minors side by side and every head version is `<minor>.0-<sha>-head`, which semver ranks by
 an arbitrary hex string.
 
+### `upgrade` — Snapshot, bump the Rancher chart, verify
+
+Takes a restore point, upgrades the `rancher` Helm release, then verifies that nothing which was
+healthy before the upgrade is broken after it.
+
+```
+roa upgrade --name <NAME> (--latest-head | --rancher-version <VER>) [OPTIONS]
+```
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--name` | | | Instance name as recorded in the local manifest |
+| `--latest-head` | | | Upgrade to the newest head chart in the running minor |
+| `--rancher-version` | | | Upgrade to this exact chart version |
+| `--rancher-repo` | | *(the repo recorded on the instance)* | Chart repo to upgrade from |
+| `--ssh-user` | | `ubuntu` | SSH user on the instance |
+| `--ssh-key` | `ROA_SSH_KEY` | *(ssh-agent / `~/.ssh/config`)* | Private key for SSH |
+| `--dry-run` | | `false` | Select and report, but change nothing |
+| `--yes` | | `false` | Skip the confirmation prompt |
+| `--skip-snapshot` | | `false` | Do not take a pre-upgrade snapshot. Unsafe |
+| `--snapshot-timeout-minutes` | | `90` | How long to wait for the snapshot to complete |
+| `--helm-timeout` | | `20m` | Timeout passed to `helm upgrade` and `rollout status` |
+| `--settle-minutes` | | `10` | How long to let downstream agents re-register before failing |
+
+Exactly one of `--latest-head` or `--rancher-version` is required — for a command that restarts
+Rancher, the target is stated rather than defaulted.
+
+**There is no rollback.** `helm rollback` does not reverse datastore migrations Rancher's
+controllers may already have run, so the EBS snapshot is the only way back. On any failure the
+snapshot id, volume id and the restore sequence are printed locally.
+
+#### Verification is differential
+
+A shared box normally has things broken that are nobody's fault — other people's downstream
+clusters sitting disconnected, a ClusterRepo failing upstream. Verification therefore captures the
+box **before** the upgrade and compares, failing only on things that **regressed**:
+
+| | |
+|---|---|
+| Healthy before, unhealthy after | **fails** (tolerated while a cluster is re-registering, until the settle window expires) |
+| Unhealthy before and after | reported, never fatal — and if it broke *differently*, the change is shown |
+| Any Helm release left `pending-*` | **fails**, always — this is how a wedged pre-upgrade hook shows up, and it blocks the following week too |
+| Chart values changed across the upgrade | **fails** — a wiped values file yields a healthy Rancher on the wrong hostname |
+| Deployment registry host changed | **fails** |
+
+#### Before it touches anything
+
+Pre-flight refuses to start if a Helm release is not `deployed`, if the root disk is ≥85% full, or
+if the target chart is already running. On a `protected` instance the confirmation requires typing
+the instance name rather than `y`.
+
+**Example:**
+
+```bash
+roa upgrade --name shared --latest-head --dry-run
+```
+
+```
+shared (i-0123456789abcdef0) shared.ui.rancher.space [us-west-2]
+
+  from   rancher-2.16.0-2f60c05-head
+  to     2.16.0-ae20b74-head
+  published 2026-09-04 17:42 UTC
+  repo   https://charts.optimus.rancher.io/server-charts/latest
+  minor  2.16
+
+  dry run: re-reading the box to check the differ against a no-op
+
+  cluster/test-two         pre-existing  unhealthy before and after (Ready=Unknown Connected=False AgentDeployed=?)
+  clusterrepo/stgregistry  pre-existing  not downloading before or after (error 500: Internal Server Error)
+
+  no regressions across a no-op interval
+
+  nothing was changed
+```
+
+`--dry-run` reads the box twice and diffs the two captures. Nothing changed in between, so on a
+quiet box the result must contain no regressions — which is how the verification rules are checked
+against real data without touching anything.
+
 ## How it works
 
 1. **Provision** launches a `t3.2xlarge` EC2 instance with a user-data bootstrap script
@@ -352,8 +432,8 @@ No Plan is written when the k3s version is unpinned (`--rancher-repo alpha`/`--d
 `--k3s-version`), since there is no minor to pin to.
 
 Moving to a new minor is a deliberate act: bump `default_k3s_version` for the Rancher minor, and
-re-point or replace the Plan's channel. Upgrade Rancher itself separately via `helm upgrade` on the
-`rancher` release.
+re-point or replace the Plan's channel. Upgrade Rancher itself with `roa upgrade`, which snapshots
+first and verifies afterwards.
 
 ## AWS permissions
 
@@ -366,6 +446,10 @@ The IAM principal running `roa` needs at minimum:
 `maintain` additionally needs:
 
 - `ec2:DescribeSnapshots`
+
+`upgrade` additionally needs:
+
+- `ec2:DescribeSnapshots`, `ec2:CreateSnapshot`, `ec2:CreateTags`
 
 ## Local state
 

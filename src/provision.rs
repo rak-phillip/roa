@@ -6,6 +6,7 @@ use aws_sdk_ec2::types::{IamInstanceProfileSpecification, BlockDeviceMapping, Eb
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
+use crate::aws::DEFAULT_REGION;
 use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
@@ -339,17 +340,24 @@ PLANEOF"#
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-west-2".to_string());
-
-    let region_provider = RegionProviderChain::default_provider()
-        .or_else(Region::new(region.clone()));
+    let region_provider =
+        RegionProviderChain::default_provider().or_else(Region::new(DEFAULT_REGION));
 
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
         .await;
+
+    // Record the region the SDK actually resolved, never a second guess at it. Reading the
+    // manifest value straight from `AWS_REGION` while the client came from the full provider chain
+    // let the two disagree the moment the region was set in `~/.aws/config` rather than the
+    // environment: the instance launches in one region and the manifest claims another. That stays
+    // invisible for as long as the ambient config keeps matching, then strands the entry -- every
+    // later command looks the instance up by the region written here.
+    let region = config
+        .region()
+        .map(|region| region.to_string())
+        .ok_or("could not resolve an AWS region")?;
     let client = Client::new(&config);
     let r53 = aws_sdk_route53::Client::new(&config);
 

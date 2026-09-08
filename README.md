@@ -57,6 +57,13 @@ ROA_AMI_ID=ami-0123456789abcdef0
 
 All variables can also be passed as CLI flags (flags take precedence over environment variables).
 
+The region is resolved by the AWS SDK's usual chain — `AWS_REGION`, then `AWS_DEFAULT_REGION`, then
+the active profile in `~/.aws/config` — falling back to `us-west-2`. `provision` records whichever
+region it actually resolved onto the manifest entry, and `maintain`, `upgrade` and `terminate` then
+target *that* region rather than the ambient config. An instance lives in exactly one region, so a
+shell pointed somewhere else does not change where its box is; setting the region per-command is
+how you provision into more than one.
+
 ## Usage
 
 ```
@@ -135,7 +142,9 @@ roa provision --name long-lived --ssh-cidr 203.0.113.7/32 --ssm-profile my-ssm-p
 ```
 
 Pair it with `--ssm-profile` so there is a way back in when the address changes. roa never creates
-the IAM profile — it only attaches one that already exists — which keeps it out of IAM entirely.
+the IAM profile — it only attaches one that already exists — though attaching it still requires
+`iam:PassRole` on that role, and reaching the box needs `ssm:StartSession`. See
+[AWS permissions](#aws-permissions).
 With a profile attached at launch, the SSM agent Ubuntu already ships registers on first boot:
 
 ```bash
@@ -437,19 +446,97 @@ first and verifies afterwards.
 
 ## AWS permissions
 
-The IAM principal running `roa` needs at minimum:
+`roa` calls EC2 and Route 53, and nothing else. `list` reads the local manifest only and needs no
+AWS access at all.
 
-- `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:TerminateInstances`
-- `ec2:CreateSecurityGroup`, `ec2:DeleteSecurityGroup`, `ec2:DescribeSecurityGroups`, `ec2:AuthorizeSecurityGroupIngress`
-- `route53:ChangeResourceRecordSets`, `route53:GetChange`
+`provision` needs:
 
-`maintain` additionally needs:
+- `ec2:RunInstances`, `ec2:DescribeInstances`
+- `ec2:CreateSecurityGroup`, `ec2:AuthorizeSecurityGroupIngress` — not needed if you always pass
+  `--security-group-id`
+- `ec2:CreateTags` — instances are tagged `Name` and `ManagedBy=roa` at launch, and tagging inside
+  the `RunInstances` call is authorized separately from the launch itself
+- `route53:ChangeResourceRecordSets` on the hosted zone, `route53:GetChange`
 
-- `ec2:DescribeSnapshots`
+`terminate` needs:
 
-`upgrade` additionally needs:
+- `ec2:DescribeInstances`, `ec2:TerminateInstances`
+- `ec2:DescribeSecurityGroups`, `ec2:DeleteSecurityGroup`
+- `route53:ChangeResourceRecordSets` on the hosted zone
 
-- `ec2:DescribeSnapshots`, `ec2:CreateSnapshot`, `ec2:CreateTags`
+`maintain` needs:
+
+- `ec2:DescribeInstances`, `ec2:DescribeSnapshots`
+
+`upgrade` needs:
+
+- `ec2:DescribeInstances`, `ec2:DescribeSnapshots`, `ec2:CreateSnapshot`, `ec2:CreateTags`
+
+The Route 53 actions are worth scoping to the one zone you provision into. `GetChange` is not a
+resource-level call and has to stay on `change/*`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/<HOSTED_ZONE_ID>"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "route53:GetChange",
+      "Resource": "arn:aws:route53:::change/*"
+    }
+  ]
+}
+```
+
+### `--ssm-profile` needs `iam:PassRole`
+
+`roa` never creates an instance profile — it only attaches one that already exists — but attaching
+it still counts as passing that role to EC2. Without `iam:PassRole` the launch fails with
+`UnauthorizedOperation`, and because the profile is usually set once in `roa_variables` as
+`ROA_SSM_PROFILE`, the failure shows up on every `provision` rather than on an unusual flag. Scope
+the grant to the single role, and to EC2:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/<SSM_ROLE>",
+  "Condition": {
+    "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+  }
+}
+```
+
+### Reaching the instance over Session Manager
+
+This one is not a `roa` permission at all: `aws ssm start-session` is a call you make yourself, and
+the CLI never touches SSM. It is listed here because `--ssm-profile` is pointless without it.
+
+`ssm:StartSession` cannot be granted by ARN over instances that do not exist yet, but it can be
+granted on a resource tag — which is why every instance is born tagged `ManagedBy=roa`. One policy
+then covers every box `roa` will ever launch, instead of an edit per instance:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "ssm:StartSession",
+  "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/*",
+  "Condition": {
+    "StringEquals": { "ssm:resourceTag/ManagedBy": "roa" }
+  }
+}
+```
+
+Starting a session also needs `ssm:StartSession` on the session documents themselves
+(`SSM-SessionManagerRunShell`, and `AWS-StartPortForwardingSession` / `AWS-StartSSHSession` if you
+forward ports or tunnel ssh), since documents carry no tags to match on. `ssm:TerminateSession` and
+`ssm:ResumeSession` scope neatly to `session/${aws:username}-*`, and `ssm:DescribeInstanceInformation`
+has to be granted on `*`.
 
 ## Local state
 

@@ -1,18 +1,20 @@
-use aws_config::meta::region::RegionProviderChain;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_ec2::Client as Ec2Client;
 
-/// Builds an EC2 client for `region`.
-///
-/// The ambient AWS config still wins; the argument is only the fallback. Callers pass the region
-/// recorded on the manifest entry so a command always targets the instance's own region rather
-/// than whatever the caller's environment happens to say.
-pub async fn ec2_client(region: &str) -> Ec2Client {
-    let region_provider =
-        RegionProviderChain::default_provider().or_else(Region::new(region.to_string()));
+/// The region assumed when nothing else resolves one.
+pub const DEFAULT_REGION: &str = "us-west-2";
 
+/// Builds an EC2 client pinned to `region`.
+///
+/// `region` wins outright over the ambient AWS config. Callers pass the region recorded on the
+/// manifest entry so a command always targets the instance's own region rather than whatever the
+/// caller's environment happens to say -- an instance is in exactly one region, and a shell
+/// pointed at another one should not silently look for it in the wrong place. Letting the ambient
+/// config take precedence made every per-instance command agree with the environment instead of
+/// with the instance, which is only invisible while the two happen to match.
+pub async fn ec2_client(region: &str) -> Ec2Client {
     let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
+        .region(Region::new(region.to_string()))
         .load()
         .await;
 

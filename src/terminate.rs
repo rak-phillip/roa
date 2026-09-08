@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::time::Duration;
-use aws_config::BehaviorVersion;
+use aws_config::{BehaviorVersion, Region};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_ec2::{Client as Ec2Client, Client};
 use aws_sdk_route53::Client as Route53Client;
@@ -8,6 +8,7 @@ use aws_sdk_ec2::types::Filter;
 use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
 use clap::{Parser};
 use tokio::time::sleep;
+use crate::aws::DEFAULT_REGION;
 use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 
 #[derive(Parser, Debug)]
@@ -29,6 +30,18 @@ pub fn termination_blocked(instances: &[Instance], instance_id: &str, force: boo
     !force && instances.iter().any(|i| i.instance_id == instance_id && i.protected)
 }
 
+/// The region an instance was provisioned into, if the manifest knows it.
+///
+/// Kept separate from building the client so the lookup is testable on its own: which region a
+/// terminate targets is the difference between deleting the box and deleting nothing while
+/// reporting success.
+pub fn manifest_region(instances: &[Instance], instance_id: &str) -> Option<String> {
+    instances
+        .iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .map(|instance| instance.region.clone())
+}
+
 pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = manifest_path();
     let instances = load_instances(&manifest_path)?;
@@ -47,7 +60,16 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
         .into());
     }
 
-    let region_provider = RegionProviderChain::default_provider().or_else("us-west-2");
+    // Terminate in the instance's own region, the same way `maintain` and `upgrade` read it.
+    // Deleting is the one command where guessing the region wrong is not a failed lookup you
+    // notice: it finds no instance, and the security group and DNS record are left behind for a
+    // box that is still running somewhere else. An id absent from the manifest has no recorded
+    // region and falls back to the ambient config.
+    let region_provider = match manifest_region(&instances, &args.instance_id) {
+        Some(region) => RegionProviderChain::first_try(Region::new(region)),
+        None => RegionProviderChain::default_provider().or_else(Region::new(DEFAULT_REGION)),
+    };
+
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
@@ -230,6 +252,33 @@ mod tests {
             rancher_repo: None,
             protected,
         }
+    }
+
+    // The manifest is what a terminate steers by, so an entry provisioned into another region has
+    // to come back as that region and not the caller's.
+    #[test]
+    fn region_comes_from_the_matching_manifest_entry() {
+        let mut far = instance("i-far", "far", false);
+        far.region = "eu-north-1".to_string();
+        let instances = vec![instance("i-near", "near", false), far];
+
+        assert_eq!(
+            manifest_region(&instances, "i-far").as_deref(),
+            Some("eu-north-1")
+        );
+        assert_eq!(
+            manifest_region(&instances, "i-near").as_deref(),
+            Some("us-west-2")
+        );
+    }
+
+    // An id roa never provisioned has no recorded region; the caller's ambient config is the only
+    // thing left to go on, so the absence has to be distinguishable from a region.
+    #[test]
+    fn an_instance_absent_from_the_manifest_has_no_region() {
+        let instances = vec![instance("i-known", "known", false)];
+
+        assert_eq!(manifest_region(&instances, "i-unknown"), None);
     }
 
     #[test]

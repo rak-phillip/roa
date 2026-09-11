@@ -317,9 +317,14 @@ fn k3s_minor_channel(k3s_version: &str) -> Option<String> {
 
 // Renders the shell that applies a system-upgrade-controller Plan tracking `channel`.
 // The channel is always minor-pinned; see the comment in `user-data` for why.
+//
+// The CRD is applied a few lines earlier in the same script, and an apply returns before the API
+// server has established it. Applying the Plan in that window fails with `no matches for kind
+// "Plan"`, and under `set -e` that ends the script before cert-manager and Rancher are installed.
 fn k3s_upgrade_plan(channel: &str) -> String {
     format!(
-        r#"kubectl apply -f - <<'PLANEOF'
+        r#"kubectl wait --for condition=established --timeout=120s crd/plans.upgrade.cattle.io
+kubectl apply -f - <<'PLANEOF'
 apiVersion: upgrade.cattle.io/v1
 kind: Plan
 metadata:
@@ -638,6 +643,15 @@ mod tests {
         assert!(!plan.contains("channels/latest"));
         assert!(plan.contains("namespace: system-upgrade"));
         assert!(plan.contains("image: rancher/k3s-upgrade"));
+    }
+
+    #[test]
+    fn the_plan_waits_for_its_crd_before_applying() {
+        let plan = k3s_upgrade_plan("v1.36");
+        let wait = plan.find("condition=established").expect("a CRD wait");
+        let apply = plan.find("kubectl apply").expect("a Plan apply");
+        assert!(wait < apply, "the Plan is applied before its CRD is established");
+        assert!(plan.contains("crd/plans.upgrade.cattle.io"));
     }
 
     fn mapping(spec: &str) -> PortMapping {

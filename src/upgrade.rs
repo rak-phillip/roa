@@ -5,7 +5,7 @@ use clap::{ArgGroup, Parser};
 
 use crate::aws::{create_snapshot, ec2_client, root_volume_id, wait_for_snapshot};
 use crate::instance::{Instance, load_instances, manifest_path, save_instances};
-use crate::maintain::{ChartEntry, RunningChart, chart_minor, newest_head_chart};
+use crate::maintain::{ChartEntry, RunningChart, chart_minor, chart_published, newest_head_chart};
 use crate::provision::RancherRepo;
 use crate::ssh::{SshTarget, run_script, split_sections};
 
@@ -67,6 +67,20 @@ pub struct UpgradeArgs {
 
     #[arg(long, default_value_t = 10, help = "How long to let downstream agents re-register before failing")]
     pub settle_minutes: u64,
+
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Consecutive quiet checks required before a clean result is accepted"
+    )]
+    pub clean_captures: u32,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Permit --rancher-version to move to a chart older than the running one"
+    )]
+    pub allow_downgrade: bool,
 
     #[arg(long, default_value_t = false, help = "Emit the report as JSON")]
     pub json: bool,
@@ -152,6 +166,7 @@ pub fn plan_upgrade(
     target: &Target,
     repo_url: &str,
     index: &str,
+    allow_downgrade: bool,
 ) -> Result<UpgradePlan, Box<dyn std::error::Error>> {
     validate_repo_url(repo_url)?;
 
@@ -161,7 +176,51 @@ pub fn plan_upgrade(
     let (to_version, to_app, published) = match target {
         Target::Pinned(version) => {
             validate_chart_version(version)?;
-            (version.clone(), version.clone(), None)
+
+            // `--latest-head` cannot go backwards by construction; a pinned version can, and a
+            // head build has no supported rollback -- an accidental downgrade is recoverable only
+            // from the EBS snapshot. Only refuse when the index dates both charts, so an unknown
+            // version stays usable rather than becoming unpinnable.
+            //
+            // The minor is checked first and needs no index. Publish dates only order charts
+            // *within* a minor: the repos build every maintained minor side by side, so on
+            // 2026-09-25 a 2.15 head published a week after the running 2.16 one passed the date
+            // check and was offered as an upgrade.
+            let target_minor = chart_minor(&format!("rancher-{}", version));
+            if let (Some(to), Some(from)) = (target_minor.as_deref().and_then(minor_key), minor_key(&minor))
+                && to < from
+                && !allow_downgrade
+            {
+                return Err(format!(
+                    "{} is a {} chart but {} is running; this is a minor downgrade and a head chart \
+                     has no supported rollback. Pass --allow-downgrade to proceed",
+                    version,
+                    target_minor.as_deref().unwrap_or("?"),
+                    minor,
+                )
+                .into());
+            }
+
+            let published = chart_published(index, version)?;
+            let running_published = chart_published(index, &strip_chart_prefix(&running.chart))?;
+
+            if let (Some(to), Some(from)) = (published, running_published)
+                && target_minor.as_deref() == Some(minor.as_str())
+                && to < from
+                && !allow_downgrade
+            {
+                return Err(format!(
+                    "{} was published {} but the running {} was published {}; this is a downgrade \
+                     and a head chart has no supported rollback. Pass --allow-downgrade to proceed",
+                    version,
+                    to.format("%Y-%m-%d %H:%M UTC"),
+                    strip_chart_prefix(&running.chart),
+                    from.format("%Y-%m-%d %H:%M UTC"),
+                )
+                .into());
+            }
+
+            (version.clone(), version.clone(), published)
         }
         Target::LatestHead => {
             let entry: ChartEntry = newest_head_chart(index, &minor)?
@@ -185,6 +244,12 @@ pub fn plan_upgrade(
         repo_url: repo_url.to_string(),
         minor,
     })
+}
+
+/// `2.16` -> `(2, 16)`, so minors compare numerically: as strings, `2.9` sorts after `2.16`.
+fn minor_key(minor: &str) -> Option<(u32, u32)> {
+    let (major, minor) = minor.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// `rancher-2.16.0-abc-head` -> `2.16.0-abc-head`. `helm list` reports the chart with its name
@@ -649,11 +714,18 @@ echo started
     )
 }
 
+/// Reads new log output, the exit code if one has been recorded, and whether the script is alive.
+///
+/// Liveness is sampled *before* `rc` is read, so a script that finishes between the two reads is
+/// seen as alive-without-rc rather than dead-without-rc.
 pub fn render_poll_script(run_dir: &str, offset: u64) -> String {
     format!(
-        r#"tail -c +{offset} '{run_dir}/upgrade.log' 2>/dev/null || true
+        r#"if pgrep -f '{run_dir}/upgrade.sh' >/dev/null; then alive=yes; else alive=no; fi
+tail -c +{offset} '{run_dir}/upgrade.log' 2>/dev/null || true
 echo '###rc'
 cat '{run_dir}/rc' 2>/dev/null || true
+echo '###alive'
+echo "$alive"
 "#,
         run_dir = run_dir,
         offset = offset + 1,
@@ -874,11 +946,28 @@ pub fn diff_world(
     // afterwards as Succeeded (or Failed, which is equally benign -- see the note in the runbook
     // about the post-upgrade `Error` pods). Judging those by container readiness reports every
     // completed job as a failure, on a box where one is almost always present.
+    //
+    // Differential like everything else: a failed helm-operation whose kubectl sidecar outlives
+    // the helm container sits `Running` and unready indefinitely. On 2026-09-25 two left over from
+    // fleet's first install made a no-op dry run report two regressions, and would have failed a
+    // clean upgrade at the end of the settle window. Unready before, under the same name, is not
+    // this run's doing.
     for a in after.pods.iter().filter(|p| is_expected_running(&p.phase)) {
         if !a.ready {
+            let already_unready = before
+                .pods
+                .iter()
+                .any(|b| b.name == a.name && is_expected_running(&b.phase) && !b.ready);
+
             findings.push(Finding {
                 subject: format!("pod/{}", a.name),
-                kind: if expired { FindingKind::Regression } else { FindingKind::Unsettled },
+                kind: if already_unready {
+                    FindingKind::PreExisting
+                } else if expired {
+                    FindingKind::Regression
+                } else {
+                    FindingKind::Unsettled
+                },
                 detail: if a.reason.is_empty() { "not ready".to_string() } else { a.reason.clone() },
             });
         }
@@ -905,6 +994,30 @@ pub fn is_settled(findings: &[Finding]) -> bool {
 
 pub fn has_regression(findings: &[Finding]) -> bool {
     findings.iter().any(|f| f.kind == FindingKind::Regression)
+}
+
+/// Counts consecutive quiet observations.
+///
+/// The point is the reset: one quiet capture proves only that nothing had happened *yet*, and the
+/// disruption a chart bump causes arrives seconds later. Anything that is not a quiet capture --
+/// findings that are still moving, or a capture that failed outright -- puts the count back to zero
+/// so the required run has to be earned in an uninterrupted stretch.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QuietRun(u32);
+
+impl QuietRun {
+    pub fn quiet(&mut self) -> u32 {
+        self.0 += 1;
+        self.0
+    }
+
+    pub fn disturbed(&mut self) {
+        self.0 = 0;
+    }
+
+    pub fn satisfied(&self, required: u32) -> bool {
+        self.0 >= required.max(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,10 +1134,20 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<(), Box<dyn std::error::Error>
 
     let index = match chart_target {
         Target::LatestHead => fetch_index(&repo_url).await?,
-        Target::Pinned(_) => String::new(),
+        // A pinned version needs no lookup to be resolved, but the downgrade guard needs publish
+        // dates to compare -- head versions cannot be ordered any other way. A fetch failure must
+        // not break a pinned upgrade that would otherwise work, so fall back to no index and let
+        // the guard stand down rather than refusing.
+        Target::Pinned(_) => match fetch_index(&repo_url).await {
+            Ok(index) => index,
+            Err(e) => {
+                println!("  warning: could not fetch the chart index ({e}); downgrade check skipped");
+                String::new()
+            }
+        },
     };
 
-    let plan = plan_upgrade(&running, &chart_target, &repo_url, &index)?;
+    let plan = plan_upgrade(&running, &chart_target, &repo_url, &index, args.allow_downgrade)?;
 
     println!("  from   {}", plan.from_chart);
     println!("  to     {}", plan.to_version);
@@ -1127,13 +1250,18 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<(), Box<dyn std::error::Error>
     }
 
     // --- verification -------------------------------------------------------
-    println!("\n  verifying (settling for up to {} minutes)\n", args.settle_minutes);
+    println!(
+        "\n  verifying ({} consecutive quiet checks, settling for up to {} minutes)\n",
+        args.clean_captures.max(1),
+        args.settle_minutes
+    );
 
     let findings = verify(
         &target,
         &before,
         &plan,
         std::time::Duration::from_secs(args.settle_minutes * 60),
+        args.clean_captures,
     )
     .await;
 
@@ -1229,6 +1357,7 @@ fn run_upgrade(
     }
 
     let mut offset: u64 = 0;
+    let mut dead_polls = 0;
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1255,17 +1384,51 @@ fn run_upgrade(
                 Err(format!("upgrade script exited {}", code).into())
             };
         }
+
+        // Nothing but the wrapper writes `rc`, so a wrapper that dies -- OOM, or a reboot that
+        // also wipes /tmp -- used to leave this loop polling forever. On 2026-09-25 helm finished
+        // with the wrapper killed and roa polled on silently until an outer timeout stopped it.
+        // A failed poll carries no `alive` section at all, so an ssh blip never counts here.
+        if script_is_gone(&sections) {
+            dead_polls += 1;
+            if dead_polls >= 2 {
+                return Err(format!(
+                    "the upgrade script on the box is no longer running and recorded no exit \
+                     status; check {}/upgrade.log and `helm status rancher -n cattle-system`",
+                    dir
+                )
+                .into());
+            }
+        } else {
+            dead_polls = 0;
+        }
     }
 }
 
+/// A poll that reached the box and found neither an exit code nor a running script.
+pub fn script_is_gone(sections: &BTreeMap<String, String>) -> bool {
+    let no_rc = sections.get("rc").is_none_or(|rc| rc.trim().is_empty());
+    no_rc && sections.get("alive").map(|a| a.trim()) == Some("no")
+}
+
 /// Re-captures the box until it settles or the window expires.
+///
+/// A single quiet capture is **not** evidence that the upgrade was clean. Rancher reacts to a
+/// chart bump asynchronously: on 2026-09-18 helm returned, the first capture found nothing, and
+/// Rancher only marked the downstream disconnected 11 seconds later -- by which point the command
+/// had already exited 0. Requiring a run of consecutive quiet captures means the window has to stay
+/// quiet, not merely start quiet. Anything that is still moving -- or a capture that fails, which
+/// is itself churn -- breaks the run and starts it over.
 async fn verify(
     target: &SshTarget<'_>,
     before: &WorldState,
     plan: &UpgradePlan,
     settle: std::time::Duration,
+    required_clean: u32,
 ) -> Vec<Finding> {
     let deadline = std::time::Instant::now() + settle;
+    let required_clean = required_clean.max(1);
+    let mut run = QuietRun::default();
 
     loop {
         let expired = std::time::Instant::now() >= deadline;
@@ -1279,12 +1442,24 @@ async fn verify(
                     if expired { Settle::Expired } else { Settle::Waiting },
                 );
 
-                if is_settled(&findings) || expired {
+                if is_settled(&findings) {
+                    let seen = run.quiet();
+                    if !run.satisfied(required_clean) && !expired {
+                        println!("  quiet {}/{}", seen, required_clean);
+                    }
+                } else {
+                    run.disturbed();
+                }
+
+                if run.satisfied(required_clean) || expired {
                     return findings;
                 }
             }
-            // A capture failure right after a restart is expected, not fatal.
+            // A capture failure right after a restart is expected, not fatal -- but it is not a
+            // quiet observation either, so it resets the run.
             Err(e) => {
+                run.disturbed();
+
                 if expired {
                     return vec![Finding {
                         subject: "capture".to_string(),
@@ -1388,6 +1563,7 @@ entries:
             &Target::LatestHead,
             "https://charts.optimus.rancher.io/server-charts/latest",
             INDEX,
+            false,
         )
         .unwrap();
 
@@ -1404,6 +1580,7 @@ entries:
             &Target::LatestHead,
             "https://charts.optimus.rancher.io/server-charts/latest",
             INDEX,
+            false,
         )
         .unwrap();
 
@@ -1419,6 +1596,7 @@ entries:
             &Target::LatestHead,
             "https://charts.optimus.rancher.io/server-charts/latest",
             INDEX,
+            false,
         )
         .unwrap_err();
 
@@ -1426,17 +1604,203 @@ entries:
     }
 
     #[test]
-    fn a_pinned_version_is_used_verbatim_and_not_looked_up() {
+    fn a_pinned_version_absent_from_the_index_is_still_usable() {
         let plan = plan_upgrade(
             &running("rancher-2.16.0-2f60c05-head"),
             &Target::Pinned("2.16.0-deadbee-head".to_string()),
             "https://charts.optimus.rancher.io/server-charts/latest",
             INDEX,
+            false,
         )
         .unwrap();
 
         assert_eq!(plan.to_version, "2.16.0-deadbee-head");
+        // The index has never heard of this chart, so there is no date to compare against and the
+        // downgrade guard has to stay out of the way rather than make it unpinnable.
         assert!(plan.published.is_none());
+    }
+
+    // A head build has no supported rollback, so moving to an older chart is recoverable only from
+    // the EBS snapshot. Versions cannot be ordered by semver, so this leans on the index's dates.
+    #[test]
+    fn refuses_a_pinned_chart_older_than_the_running_one() {
+        let err = plan_upgrade(
+            &running("rancher-2.16.0-ae20b74-head"),
+            &Target::Pinned("2.16.0-ef86dbf-head".to_string()),
+            "https://charts.optimus.rancher.io/server-charts/latest",
+            INDEX,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("downgrade"));
+    }
+
+    #[test]
+    fn allows_a_downgrade_when_asked_explicitly() {
+        let plan = plan_upgrade(
+            &running("rancher-2.16.0-ae20b74-head"),
+            &Target::Pinned("2.16.0-ef86dbf-head".to_string()),
+            "https://charts.optimus.rancher.io/server-charts/latest",
+            INDEX,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.to_version, "2.16.0-ef86dbf-head");
+    }
+
+    // The by-date trap through the pinned door: the 2.15 head in the fixture was published *after*
+    // the running 2.16 one, so a date-only guard waves a minor downgrade through. Reproduced live on
+    // 2026-09-25 with 2.15.3-a8cf1e5-head against a 2.16 box.
+    #[test]
+    fn refuses_an_older_minor_even_when_it_was_published_later() {
+        let err = plan_upgrade(
+            &running("rancher-2.16.0-ae20b74-head"),
+            &Target::Pinned("2.15.2-afd2238-head".to_string()),
+            "https://charts.optimus.rancher.io/server-charts/latest",
+            INDEX,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("minor downgrade"), "{}", err);
+
+        // Needs no index at all -- the minor is in the version string.
+        assert!(
+            plan_upgrade(
+                &running("rancher-2.16.0-ae20b74-head"),
+                &Target::Pinned("2.15.2-afd2238-head".to_string()),
+                "https://charts.optimus.rancher.io/server-charts/latest",
+                "",
+                false,
+            )
+            .is_err()
+        );
+
+        assert!(
+            plan_upgrade(
+                &running("rancher-2.16.0-ae20b74-head"),
+                &Target::Pinned("2.15.2-afd2238-head".to_string()),
+                "https://charts.optimus.rancher.io/server-charts/latest",
+                INDEX,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    // Dates do not order charts across minors, so they must not block a real minor upgrade either:
+    // 2.16.0-ef86dbf was published before 2.15.2-afd2238, and moving to it is still forwards.
+    #[test]
+    fn a_newer_minor_is_not_a_downgrade_whatever_its_date() {
+        let plan = plan_upgrade(
+            &running("rancher-2.15.2-afd2238-head"),
+            &Target::Pinned("2.16.0-ef86dbf-head".to_string()),
+            "https://charts.optimus.rancher.io/server-charts/latest",
+            INDEX,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.to_version, "2.16.0-ef86dbf-head");
+    }
+
+    #[test]
+    fn minors_compare_numerically() {
+        assert!(minor_key("2.9") < minor_key("2.16"));
+        assert_eq!(minor_key("2.x"), None);
+    }
+
+    // The guard must not fire on the ordinary case, or every upgrade needs the escape hatch.
+    #[test]
+    fn a_newer_pinned_chart_is_not_a_downgrade() {
+        let plan = plan_upgrade(
+            &running("rancher-2.16.0-ef86dbf-head"),
+            &Target::Pinned("2.16.0-ae20b74-head".to_string()),
+            "https://charts.optimus.rancher.io/server-charts/latest",
+            INDEX,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.to_version, "2.16.0-ae20b74-head");
+        assert!(plan.published.is_some());
+    }
+
+    // --- settling ----------------------------------------------------------
+
+    // The 2026-09-18 miss in one assertion: helm returned, the first capture was quiet, and the
+    // downstream only dropped eleven seconds later. One quiet capture must never be enough.
+    #[test]
+    fn one_quiet_capture_does_not_satisfy_a_run_of_three() {
+        let mut run = QuietRun::default();
+        run.quiet();
+
+        assert!(!run.satisfied(3));
+    }
+
+    #[test]
+    fn three_uninterrupted_quiet_captures_satisfy_a_run_of_three() {
+        let mut run = QuietRun::default();
+        run.quiet();
+        run.quiet();
+        run.quiet();
+
+        assert!(run.satisfied(3));
+    }
+
+    // The reset is the whole mechanism: a disruption part-way through means the run has to be
+    // earned again from zero, rather than the earlier quiet captures counting toward it.
+    #[test]
+    fn a_disturbance_restarts_the_run() {
+        let mut run = QuietRun::default();
+        run.quiet();
+        run.quiet();
+        run.disturbed();
+        run.quiet();
+        run.quiet();
+
+        assert!(!run.satisfied(3));
+
+        run.quiet();
+        assert!(run.satisfied(3));
+    }
+
+    // A capture that fails is churn, not quiet -- it usually means Rancher is restarting.
+    #[test]
+    fn a_failed_capture_counts_as_a_disturbance() {
+        let mut run = QuietRun::default();
+        run.quiet();
+        run.quiet();
+        run.disturbed(); // what verify() does in the Err arm
+        assert!(!run.satisfied(2));
+    }
+
+    // `--clean-captures 0` would otherwise restore exactly the bug this guards against.
+    #[test]
+    fn a_vanished_script_is_detected_but_an_ssh_blip_is_not() {
+        let polled = |out: &str| split_sections(out);
+
+        // Wrapper killed: helm finished, nothing wrote rc, nothing is running.
+        assert!(script_is_gone(&polled("deployment rolled out\n###rc\n###alive\nno\n")));
+
+        // Still running, or finished normally: not gone.
+        assert!(!script_is_gone(&polled("###rc\n###alive\nyes\n")));
+        assert!(!script_is_gone(&polled("###rc\n0\n###alive\nno\n")));
+
+        // A poll that never reached the box has no sections at all -- Run D rode out a 60s
+        // outage on exactly this, and it must stay that way.
+        assert!(!script_is_gone(&polled("")));
+    }
+
+    #[test]
+    fn a_required_run_below_one_is_still_one() {
+        let mut run = QuietRun::default();
+        assert!(!run.satisfied(0));
+
+        run.quiet();
+        assert!(run.satisfied(0));
     }
 
     // --- pre-flight --------------------------------------------------------
@@ -1603,6 +1967,36 @@ entries:
             ..Default::default()
         };
         assert!(has_regression(&diff_world(&before, &stuck, None, Settle::Expired)));
+    }
+
+    // A failed helm-operation keeps its kubectl sidecar alive, so the pod sits `Running` and
+    // unready long after the operation died. Two left over from fleet's first install made a no-op
+    // dry run report two regressions on 2026-09-25. Unready before and after is pre-existing --
+    // but a pod that turns unready during the upgrade must still fail it.
+    #[test]
+    fn a_pod_already_unready_before_the_upgrade_is_pre_existing() {
+        let pod = |name: &str, ready: bool| PodState {
+            name: name.to_string(),
+            phase: "Running".to_string(),
+            ready,
+            reason: if ready { String::new() } else { "Error".to_string() },
+        };
+
+        let before = WorldState {
+            pods: vec![pod("rancher-a", true), pod("helm-operation-vpwm4", false)],
+            ..Default::default()
+        };
+
+        let unchanged = diff_world(&before, &before.clone(), None, Settle::Expired);
+        assert!(!has_regression(&unchanged));
+        assert!(is_settled(&unchanged), "a stale pod must not hold the settle window open");
+        assert!(unchanged.iter().any(|f| f.kind == FindingKind::PreExisting));
+
+        let worse = WorldState {
+            pods: vec![pod("rancher-a", false), pod("helm-operation-vpwm4", false)],
+            ..Default::default()
+        };
+        assert!(has_regression(&diff_world(&before, &worse, None, Settle::Expired)));
     }
 
     #[test]

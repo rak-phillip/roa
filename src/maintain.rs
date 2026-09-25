@@ -477,6 +477,24 @@ pub fn newest_head_chart(index: &str, minor: &str) -> Result<Option<ChartEntry>,
         .cloned())
 }
 
+// Publish date of one exact chart version, or None when the index does not carry it.
+//
+// Head versions cannot be ordered by semver (see `newest_head_chart`), so comparing two charts'
+// ages is only possible through the index. A version the index has never heard of is `None` rather
+// than an error: a pinned chart from a repo that has since dropped it is unusual, not invalid.
+pub fn chart_published(
+    index: &str,
+    version: &str,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let index: ChartIndex = serde_norway::from_str(index)?;
+
+    let Some(entries) = index.entries.get("rancher") else {
+        return Ok(None);
+    };
+
+    Ok(entries.iter().find(|e| e.version == version).map(|e| e.created))
+}
+
 // `rancher-2.16.0-<sha>-head` -> `2.16`, and `rancher-2.16-<sha>-head` -> `2.16`.
 //
 // The minor is truncated at the first non-digit because the pre-release repos publish both

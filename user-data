@@ -116,3 +116,36 @@ helm install rancher rancher-latest/rancher \
   --set agentTLSMode=system-store \
   "<RANCHER_BOOTSTRAP_PASSWORD>" \
   "<RANCHER_VERSION>"
+
+# Rancher normally learns its own address during the first UI login, and until it does the
+# `server-url` setting is empty. An empty `server-url` blocks the `cluster-deploy` handler, so a
+# downstream cluster imported before anyone has logged in never leaves `Ready=False` -- while its
+# agent looks entirely healthy from below, resolving the FQDN and holding an open websocket. The
+# hostname is known here, so set it rather than leaving it to whoever logs in first.
+#
+# The Setting object is created by Rancher itself, so it cannot be patched until the CRD exists and
+# Rancher has populated it; both are racy against this script. Failing to set it must not fail the
+# install -- an un-bootstrapped Rancher is still a working Rancher for every other purpose.
+#
+# `kubectl wait --for=create` only waits for an *object*; if the resource type is not registered
+# yet it fails at once rather than waiting. On 2026-09-25 helm returned three minutes before Rancher
+# registered the Settings CRD, so the wait below failed in the same second and the 300s never
+# applied. Wait for the type first.
+crd_deadline=$((SECONDS + 900))
+until kubectl get crd settings.management.cattle.io >/dev/null 2>&1 || [ "$SECONDS" -ge "$crd_deadline" ]; do
+  sleep 10
+done
+
+if kubectl wait --for=create --timeout=300s \
+    setting.management.cattle.io/server-url >/dev/null 2>&1; then
+  for _ in $(seq 1 10); do
+    if kubectl patch setting.management.cattle.io server-url \
+        --type=merge -p '{"value":"https://<RANCHER_HOSTNAME>"}' >/dev/null 2>&1; then
+      echo "server-url set to https://<RANCHER_HOSTNAME>"
+      break
+    fi
+    sleep 15
+  done
+else
+  echo "WARNING: server-url setting never appeared; import a downstream only after a UI login"
+fi

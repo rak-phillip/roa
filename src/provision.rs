@@ -404,9 +404,14 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         }
     };
 
+    let rancher_hostname = args.rancher_hostname.clone().unwrap_or_else(|| fqdn.clone());
+
     let user_data_script = render_sshd_hardening(&match args.mode {
         ProvisionMode::Helm => include_str!("../user-data")
-            .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
+            // The quoted form carries its own quotes and loses them here; the bare form is for the
+            // places the hostname appears inside a larger string, such as the server-url patch.
+            .replace("\"<RANCHER_HOSTNAME>\"", &rancher_hostname)
+            .replace("<RANCHER_HOSTNAME>", &rancher_hostname)
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version)
@@ -811,6 +816,23 @@ mod tests {
         let without_plan = template.replace("\"<K3S_UPGRADE_PLAN>\"", "");
         assert!(!without_plan.contains("kind: Plan"));
         assert!(!without_plan.contains("<K3S_UPGRADE_PLAN>"));
+    }
+
+    // An empty `server-url` blocks Rancher's cluster-deploy handler, so a downstream imported
+    // before anyone has logged into the UI never leaves `Ready=False`. The hostname appears here
+    // inside a JSON patch rather than as its own quoted token, so it needs the bare substitution --
+    // the quoted-only replace this test guards against would leave the placeholder on the box.
+    #[test]
+    fn rendering_user_data_sets_server_url_to_the_real_hostname() {
+        let hostname = "prak-upgrade-ds.ui.rancher.space";
+
+        let rendered = include_str!("../user-data")
+            .replace("\"<RANCHER_HOSTNAME>\"", hostname)
+            .replace("<RANCHER_HOSTNAME>", hostname);
+
+        assert!(rendered.contains("setting.management.cattle.io server-url"));
+        assert!(rendered.contains(&format!(r#"{{"value":"https://{}"}}"#, hostname)));
+        assert!(!rendered.contains("<RANCHER_HOSTNAME>"));
     }
 
     #[test]

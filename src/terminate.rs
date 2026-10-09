@@ -3,6 +3,7 @@ use std::time::Duration;
 use aws_config::{BehaviorVersion, Region};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_ec2::{Client as Ec2Client, Client};
+use aws_sdk_ec2::error::ProvideErrorMetadata;
 use aws_sdk_route53::Client as Route53Client;
 use aws_sdk_ec2::types::Filter;
 use aws_sdk_route53::types::{ResourceRecord, ResourceRecordSet, RrType, Change, ChangeAction, ChangeBatch};
@@ -78,24 +79,49 @@ pub async fn terminate(args: TerminateArgs) -> Result<(), Box<dyn std::error::Er
     let ec2 = Ec2Client::new(&config);
     let r53 = Route53Client::new(&config);
 
-    let (instance_name, public_ip) = get_instance_details(&ec2, &args.instance_id)
-        .await
-        .unwrap_or(("".to_string(), "".to_string()));
+    let manifest_entry = instances.iter().find(|i| i.instance_id == args.instance_id);
 
-    let resp = ec2.terminate_instances()
-        .instance_ids(&args.instance_id)
-        .send()
-        .await?;
+    // EC2 forgets a terminated instance after about an hour, so a box torn down outside roa (or by
+    // a terminate that died before saving the manifest) describes as empty. Fall back to what the
+    // manifest recorded so the DNS record and security group can still be found.
+    let (instance_name, public_ip) = match get_instance_details(&ec2, &args.instance_id).await {
+        Ok(details) => details,
+        Err(_) => manifest_entry
+            .map(|i| (i.name.clone(), i.public_ip.clone()))
+            .unwrap_or_default(),
+    };
 
-    let terminating_instance = resp.terminating_instances()
-        .first()
-        .and_then(|instance| instance.instance_id())
-        .unwrap_or("<unknown>");
+    match ec2.terminate_instances().instance_ids(&args.instance_id).send().await {
+        Ok(resp) => {
+            let terminating_instance = resp.terminating_instances()
+                .first()
+                .and_then(|instance| instance.instance_id())
+                .unwrap_or("<unknown>");
 
-    println!("Terminating instance: {}", terminating_instance);
+            println!("Terminating instance: {}", terminating_instance);
 
-    if let Err(e) = wait_for_instance_termination(&ec2, &args.instance_id).await {
-        eprintln!("Warning: failed waiting for terminated state: {}", e);
+            if let Err(e) = wait_for_instance_termination(&ec2, &args.instance_id).await {
+                eprintln!("Warning: failed waiting for terminated state: {}", e);
+            }
+        }
+        // Only an id the manifest placed in this region is known to be gone. Without a manifest
+        // entry the region was a guess, and "not found" may just mean the box runs somewhere else.
+        Err(e) if manifest_entry.is_some()
+            && e.as_service_error().and_then(|se| se.code()) == Some("InvalidInstanceID.NotFound") =>
+        {
+            println!(
+                "Instance {} no longer exists; cleaning up its DNS record, security group and manifest entry",
+                args.instance_id
+            );
+        }
+        Err(e) => {
+            return Err(format!(
+                "Failed to terminate {}: {}",
+                args.instance_id,
+                aws_sdk_ec2::error::DisplayErrorContext(&e)
+            )
+            .into());
+        }
     }
 
     if !instance_name.is_empty() && !public_ip.is_empty() {

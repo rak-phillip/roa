@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Parser};
 
-use crate::aws::{create_snapshot, ec2_client, root_volume_id, wait_for_snapshot};
+use crate::aws::{create_snapshot, ec2_client, root_volume, RootVolume, wait_for_snapshot};
 use crate::instance::{Instance, load_instances, manifest_path, save_instances};
 use crate::maintain::{ChartEntry, RunningChart, chart_minor, chart_published, fetch_index, newest_head_chart};
 use crate::provision::RancherRepo;
@@ -627,27 +627,39 @@ pub fn snapshot_tags(
 }
 
 /// Printed locally on any failure -- never to the box, which may be the thing that is broken.
-pub fn restore_instructions(instance: &Instance, snapshot_id: &str, volume_id: &str) -> String {
+///
+/// Every value is filled in. The note is read during an outage, which is the worst time to go
+/// looking up an availability zone or a device name.
+pub fn restore_instructions(instance: &Instance, snapshot_id: &str, root: &RootVolume) -> String {
     format!(
         "  RESTORE POINT\n\
          \x20   snapshot  {snapshot}\n\
-         \x20   volume    {volume}\n\
+         \x20   volume    {volume} ({device}, {az})\n\
          \x20   instance  {id} ({name}) in {region}\n\
          \n\
          \x20 There is no supported rollback for a head build -- `helm rollback` does not reverse\n\
-         \x20 datastore migrations Rancher's controllers may already have run. To go back:\n\
-         \x20   1. aws ec2 stop-instances --instance-ids {id} --region {region}\n\
-         \x20   2. aws ec2 detach-volume --volume-id {volume} --region {region}\n\
-         \x20   3. aws ec2 create-volume --snapshot-id {snapshot} --availability-zone <same-az> --region {region}\n\
-         \x20   4. aws ec2 attach-volume --instance-id {id} --volume-id <new-volume> --device /dev/sda1 --region {region}\n\
+         \x20 datastore migrations Rancher's controllers may already have run. Going back means\n\
+         \x20 replacing the root volume, and that needs a STOP, not a reboot. This instance has no\n\
+         \x20 Elastic IP, so the stop gives it a new public address and DNS has to follow it:\n\
+         \x20   1. aws ec2 create-volume --snapshot-id {snapshot} --availability-zone {az} --region {region}\n\
+         \x20      aws ec2 wait volume-available --volume-ids <new-volume> --region {region}\n\
+         \x20   2. aws ec2 stop-instances --instance-ids {id} --region {region}\n\
+         \x20      aws ec2 wait instance-stopped --instance-ids {id} --region {region}\n\
+         \x20   3. aws ec2 detach-volume --volume-id {volume} --region {region}\n\
+         \x20   4. aws ec2 attach-volume --instance-id {id} --volume-id <new-volume> --device {device} --region {region}\n\
          \x20   5. aws ec2 start-instances --instance-ids {id} --region {region}\n\
-         \x20 Reboot only -- this instance has no Elastic IP and its A record is a literal, so a\n\
-         \x20 stop/start reassigns the address and breaks DNS. Re-point Route 53 afterwards.",
+         \x20   6. Point the {fqdn} A record (zone {zone}) at the new public IP, and update\n\
+         \x20      public_ip for {name} in the roa manifest.\n\
+         \x20 Keep the old volume {volume} until the restored box is confirmed healthy.",
         snapshot = snapshot_id,
-        volume = volume_id,
+        volume = root.volume_id,
+        device = root.device,
+        az = root.availability_zone,
         id = instance.instance_id,
         name = instance.name,
         region = instance.region,
+        fqdn = instance.fqdn,
+        zone = instance.hosted_zone_id,
     )
 }
 
@@ -1200,7 +1212,8 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<(), Box<dyn std::error::Error>
         }
 
         let ec2 = ec2_client(&instance.region).await;
-        let volume_id = root_volume_id(&ec2, &instance.instance_id).await?;
+        let root = root_volume(&ec2, &instance.instance_id).await?;
+        let volume_id = root.volume_id.clone();
         let now = Utc::now();
 
         let snapshot_id = create_snapshot(
@@ -1212,7 +1225,7 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<(), Box<dyn std::error::Error>
         .await?;
 
         println!("  snapshot {} of {} created", snapshot_id, volume_id);
-        restore_note = Some(restore_instructions(&instance, &snapshot_id, &volume_id));
+        restore_note = Some(restore_instructions(&instance, &snapshot_id, &root));
 
         wait_for_snapshot(&ec2, &snapshot_id, std::time::Duration::from_secs(args.snapshot_timeout_minutes * 60))
             .await
@@ -2001,6 +2014,50 @@ entries:
     #[test]
     fn reads_the_root_percentage_off_df() {
         assert_eq!(parse_disk_percent("/dev/root 101582828 43887560 57678884 44% /\n"), Some(44));
+    }
+
+    // --- the restore note ----------------------------------------------------
+
+    fn restore_note() -> String {
+        let instance = Instance {
+            instance_id: "i-0abc".to_string(),
+            name: "shared".to_string(),
+            public_ip: "203.0.113.1".to_string(),
+            fqdn: "shared.ui.rancher.space".to_string(),
+            security_group_id: "sg-0".to_string(),
+            hosted_zone_id: "Z0".to_string(),
+            region: "us-west-2".to_string(),
+            created_at: "2026-08-13 21:46:39 UTC".to_string(),
+            rancher_repo: None,
+            protected: true,
+        };
+        let root = RootVolume {
+            volume_id: "vol-0old".to_string(),
+            device: "/dev/sda1".to_string(),
+            availability_zone: "us-west-2b".to_string(),
+        };
+        restore_instructions(&instance, "snap-0abc", &root)
+    }
+
+    // The 2026-10-02 note told the reader to stop the instance and then to "reboot only", and
+    // left the availability zone for them to look up mid-outage.
+    #[test]
+    fn the_restore_note_leaves_nothing_to_fill_in_but_the_new_volume() {
+        let note = restore_note();
+
+        assert!(note.contains("--availability-zone us-west-2b"));
+        assert!(note.contains("--device /dev/sda1"));
+        let placeholders: Vec<&str> = note.matches('<').collect();
+        assert_eq!(note.matches("<new-volume>").count(), placeholders.len());
+    }
+
+    #[test]
+    fn the_restore_note_does_not_contradict_its_own_stop() {
+        let note = restore_note();
+
+        assert!(note.contains("stop-instances"));
+        assert!(!note.to_lowercase().contains("reboot only"));
+        assert!(note.contains("shared.ui.rancher.space A record (zone Z0)"));
     }
 
     // --- the datastore copy --------------------------------------------------

@@ -21,6 +21,13 @@ pub async fn ec2_client(region: &str) -> Ec2Client {
     Ec2Client::new(&config)
 }
 
+/// An instance's root EBS volume and where it is attached.
+pub struct RootVolume {
+    pub volume_id: String,
+    pub device: String,
+    pub availability_zone: String,
+}
+
 /// Resolves an instance's root EBS volume.
 ///
 /// Both reading snapshots (`maintain`) and creating one (`upgrade`) need this, and neither should
@@ -30,6 +37,14 @@ pub async fn root_volume_id(
     ec2: &Ec2Client,
     instance_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(root_volume(ec2, instance_id).await?.volume_id)
+}
+
+/// Like [`root_volume_id`], plus the device and availability zone a restored volume has to match.
+pub async fn root_volume(
+    ec2: &Ec2Client,
+    instance_id: &str,
+) -> Result<RootVolume, Box<dyn std::error::Error>> {
     let described = ec2
         .describe_instances()
         .instance_ids(instance_id)
@@ -52,7 +67,16 @@ pub async fn root_volume_id(
         .and_then(|e| e.volume_id())
         .ok_or("could not resolve the root volume")?;
 
-    Ok(volume_id.to_string())
+    let availability_zone = root_device
+        .placement()
+        .and_then(|p| p.availability_zone())
+        .ok_or("could not resolve the instance's availability zone")?;
+
+    Ok(RootVolume {
+        volume_id: volume_id.to_string(),
+        device: root_name.to_string(),
+        availability_zone: availability_zone.to_string(),
+    })
 }
 
 use aws_sdk_ec2::types::{ResourceType, Tag, TagSpecification};

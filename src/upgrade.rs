@@ -1283,15 +1283,26 @@ pub async fn upgrade(args: UpgradeArgs) -> Result<(), Box<dyn std::error::Error>
 
 // A consistent copy of the datastore, taken before the EBS snapshot so it lands inside it. k3s
 // uses sqlite by default and etcd when clustered; try etcd first and fall back.
+//
+// Every test of the datastore runs under sudo. /var/lib/rancher/k3s/server is root 0700, so an
+// unprivileged `[ -f .../state.db ]` is always false -- that is how 2026-09-11 and 2026-10-09 both
+// printed "no state.db" on a box that has one, and took no datastore copy at all.
 const DATASTORE_SNAPSHOT_SCRIPT: &str = r#"
 set -uo pipefail
 stamp=$(date -u +%Y%m%d-%H%M%S)
-if sudo -n k3s etcd-snapshot save --name "roa-upgrade-${stamp}" >/dev/null 2>&1; then
+db=/var/lib/rancher/k3s/server/db
+if ! sudo -n true 2>/dev/null; then
+  echo "no datastore snapshot taken (passwordless sudo unavailable)"
+elif sudo -n k3s etcd-snapshot save --name "roa-upgrade-${stamp}" >/dev/null 2>&1; then
   echo "etcd snapshot roa-upgrade-${stamp} saved"
-elif [ -f /var/lib/rancher/k3s/server/db/state.db ]; then
-  sudo -n sqlite3 /var/lib/rancher/k3s/server/db/state.db     ".backup '/var/lib/rancher/k3s/server/db/roa-upgrade-${stamp}.db'" 2>/dev/null     && echo "sqlite datastore copied to roa-upgrade-${stamp}.db"     || echo "no datastore snapshot taken (sqlite3 unavailable)"
+elif ! sudo -n test -f "${db}/state.db"; then
+  echo "no datastore snapshot taken (no etcd, no ${db}/state.db)"
+elif ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "no datastore snapshot taken (state.db exists but sqlite3 is not installed: apt install sqlite3)"
+elif sudo -n sqlite3 "${db}/state.db" ".backup '${db}/roa-upgrade-${stamp}.db'"; then
+  echo "sqlite datastore copied to ${db}/roa-upgrade-${stamp}.db"
 else
-  echo "no datastore snapshot taken (no etcd, no state.db)"
+  echo "no datastore snapshot taken (sqlite3 .backup failed)"
 fi
 "#;
 
@@ -1990,5 +2001,17 @@ entries:
     #[test]
     fn reads_the_root_percentage_off_df() {
         assert_eq!(parse_disk_percent("/dev/root 101582828 43887560 57678884 44% /\n"), Some(44));
+    }
+
+    // --- the datastore copy --------------------------------------------------
+
+    // The parent directories are root 0700; a test of state.db that does not go through sudo is
+    // always false, and the copy silently never happens.
+    #[test]
+    fn the_datastore_script_only_looks_for_state_db_through_sudo() {
+        for line in DATASTORE_SNAPSHOT_SCRIPT.lines().filter(|l| l.contains("state.db")) {
+            let tests_for_it = line.contains("[ -f") || line.contains("test -f");
+            assert!(!tests_for_it || line.contains("sudo -n test -f"), "unprivileged test: {}", line);
+        }
     }
 }

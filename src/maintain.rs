@@ -456,6 +456,25 @@ pub struct ChartEntry {
     pub created: DateTime<Utc>,
 }
 
+pub async fn fetch_index(repo_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}/index.yaml", repo_url.trim_end_matches('/'));
+    let body = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(body)
+}
+
+// Every `rancher` chart in the index, in the index's own order.
+pub fn rancher_charts(index: &str) -> Result<Vec<ChartEntry>, Box<dyn std::error::Error>> {
+    let mut index: ChartIndex = serde_norway::from_str(index)?;
+    Ok(index.entries.remove("rancher").unwrap_or_default())
+}
+
 // Newest `<minor>.*-head` chart in the index, chosen by publish date.
 //
 // NEVER pick by semver. This repo carries 2.14, 2.15 and 2.16 pre-release charts side by side

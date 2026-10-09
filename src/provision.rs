@@ -224,7 +224,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
+    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>.<minor>`")]
     rancher_repo: RancherRepo,
 
     #[arg(long, default_value_t = false, help = "Mark the instance protected so `terminate` refuses it without --force")]

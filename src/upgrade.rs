@@ -5,7 +5,7 @@ use clap::{ArgGroup, Parser};
 
 use crate::aws::{create_snapshot, ec2_client, root_volume_id, wait_for_snapshot};
 use crate::instance::{Instance, load_instances, manifest_path, save_instances};
-use crate::maintain::{ChartEntry, RunningChart, chart_minor, chart_published, newest_head_chart};
+use crate::maintain::{ChartEntry, RunningChart, chart_minor, chart_published, fetch_index, newest_head_chart};
 use crate::provision::RancherRepo;
 use crate::ssh::{SshTarget, run_script, split_sections};
 
@@ -1037,18 +1037,6 @@ fn capture_world(target: &SshTarget) -> Result<WorldState, Box<dyn std::error::E
     }
 
     Ok(parse_world(&split_sections(&output.stdout)))
-}
-
-async fn fetch_index(repo_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let url = format!("{}/index.yaml", repo_url.trim_end_matches('/'));
-    let body = reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await?
-        .text()
-        .await?;
-    Ok(body)
 }
 
 fn print_findings(findings: &[Finding]) {

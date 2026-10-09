@@ -97,7 +97,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--mode` | `helm` | Install method: `helm` (k3s + Helm) or `docker` |
 | `--storage-gb` | `64` | EBS root volume size in GB |
 | `--security-group-id` | *(auto-created)* | Use an existing security group instead of creating one |
-| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>-<minor>` |
+| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>.<minor>` |
 | `--rancher-version` | *(latest dev)* | Pin a specific Rancher version (e.g. `2.9.0`) |
 | `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
@@ -192,6 +192,43 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
 Use the bare form for a NodePort, never a `HOST:CONTAINER` pair. A NodePort has no way to learn that
 the host publishes it as some other port, so `8443:30443` would leave anything that reads the cluster
 to build a URL — a UI extension, a script — with no way to be right.
+
+### `versions` — List the Rancher charts a repo offers
+
+Lists a repo's `rancher` charts, newest published first, so you can choose a `--rancher-version`
+for `provision` or `upgrade`.
+
+```
+roa versions [--rancher-repo <REPO>] [--minor <MINOR>] [--head] [--limit <N> | --all]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rancher-repo` | `latest` | Repo to list. Takes the same values as `provision` |
+| `--minor` | *(all)* | Only list charts for this Rancher minor, e.g. `2.16` |
+| `--head` | `false` | Only list head charts |
+| `--limit` | `20` | Number of charts to list |
+| `--all` | `false` | List every matching chart |
+
+```bash
+roa versions --rancher-repo prime-latest --minor 2.16 --head --limit 3
+```
+
+```
+  PUBLISHED             VERSION              APP VERSION
+  2026-10-01 17:46 UTC  2.16.0-de13353-head  v2.16.0-de13353-head
+  2026-10-01 15:51 UTC  2.16.0-6620c97-head  v2.16.0-6620c97-head
+  2026-10-01 13:00 UTC  2.16.0-cc343bf-head  v2.16.0-cc343bf-head
+
+  showing 3 of 90; pass --all to list every one
+
+  An unpinned `roa provision` installs 2.16.0-ffbd1cc914559930ba6aaa03bc434ef32aefe490-head (published 2026-08-21).
+```
+
+The last line shows the chart you get when you leave `--rancher-version` off. `provision` then
+installs with `--devel`, so Helm takes the highest semver in the whole repo. Head versions are
+ranked by their commit SHA, so that chart can be weeks old and can belong to any minor in the repo.
+Pin a version from the list to get the build you want.
 
 ### `terminate` — Terminate a Rancher instance
 

@@ -190,14 +190,17 @@ pub async fn maintain(args: MaintainArgs) -> Result<(), Box<dyn std::error::Erro
 const REMOTE_SCRIPT: &str = r#"
 export KUBECONFIG=${KUBECONFIG:-$HOME/.kube/config}
 echo '###apt'
-if [ -x /usr/lib/update-notifier/apt-check ]; then
-  # Writes `total;security` to stderr with no trailing newline.
-  /usr/lib/update-notifier/apt-check 2>&1
-  echo
+# `upgrade;upgrade-security;full-upgrade;full-upgrade-security`, from apt-get's own simulation.
+# apt-check counts what a full-upgrade would install, so a kernel kept back for new dependencies
+# made the report say 9 pending while `apt upgrade` installed 4 (2026-10-02). Both counts honour
+# phasing, so a phased package appears in neither.
+if up=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null) \
+   && full=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null); then
+  up=$(printf '%s\n' "$up" | grep '^Inst ' || true)
+  full=$(printf '%s\n' "$full" | grep '^Inst ' || true)
+  echo "$(printf '%s' "$up" | grep -c . || true);$(printf '%s' "$up" | grep -c -- '-security' || true);$(printf '%s' "$full" | grep -c . || true);$(printf '%s' "$full" | grep -c -- '-security' || true)"
 else
-  total=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c . || true)
-  security=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c -- '-security' || true)
-  echo "${total};${security}"
+  echo 'apt-get simulation failed'
 fi
 echo '###reboot'
 if [ -f /var/run/reboot-required ]; then
@@ -258,21 +261,30 @@ fn check_os_updates(sections: &BTreeMap<String, String>) -> Check {
         return Check::unknown("os-updates", "not collected");
     };
 
-    // apt-check writes `total;security` to stderr, which the script folds into stdout.
-    let line = raw.lines().find(|l| l.contains(';')).unwrap_or("").trim();
-    let mut parts = line.split(';');
+    let line = raw.lines().find(|l| l.contains(';')).unwrap_or(raw.trim()).trim();
+    let counts: Vec<u32> = line.split(';').filter_map(|p| p.trim().parse().ok()).collect();
 
-    match (parts.next().and_then(|p| p.trim().parse::<u32>().ok()),
-           parts.next().and_then(|p| p.trim().parse::<u32>().ok())) {
-        (Some(total), Some(security)) => {
-            let detail = format!("{} pending, {} security", total, security);
-            if security > 0 {
-                Check::attention("os-updates", detail)
-            } else {
-                Check::ok("os-updates", detail)
-            }
-        }
-        _ => Check::unknown("os-updates", format!("unparsed apt output: {}", line)),
+    let [upgrade, security, full, full_security] = counts[..] else {
+        return Check::unknown("os-updates", format!("unparsed apt output: {}", line));
+    };
+
+    // What `apt upgrade` will do comes first, because that is what the window runs. Anything only
+    // a full-upgrade installs -- usually a new kernel's meta packages -- is reported separately so
+    // the two counts never get compared against each other again.
+    let mut detail = format!("{} pending, {} security", upgrade, security);
+    let held = full.saturating_sub(upgrade);
+    if held > 0 {
+        detail.push_str(&format!(
+            "; {} more held back for full-upgrade ({} security)",
+            held,
+            full_security.saturating_sub(security)
+        ));
+    }
+
+    if full_security > 0 {
+        Check::attention("os-updates", detail)
+    } else {
+        Check::ok("os-updates", detail)
     }
 }
 
@@ -899,13 +911,43 @@ entries:
     #[test]
     fn flags_pending_security_updates() {
         let mut sections = BTreeMap::new();
-        sections.insert("apt".to_string(), "191;137\n".to_string());
+        sections.insert("apt".to_string(), "191;137;191;137\n".to_string());
         let check = check_os_updates(&sections);
         assert_eq!(check.status, Status::Attention);
         assert!(check.detail.contains("137 security"));
 
-        sections.insert("apt".to_string(), "3;0\n".to_string());
+        sections.insert("apt".to_string(), "3;0;3;0\n".to_string());
         assert_eq!(check_os_updates(&sections).status, Status::Ok);
+    }
+
+    // 2026-10-02: the report said 9 pending, `apt upgrade` installed 4, and the other 5 were a
+    // kernel kept back for new dependencies. The detail has to say which is which.
+    #[test]
+    fn separates_what_upgrade_installs_from_what_full_upgrade_would() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "4;0;9;0\n".to_string());
+        let check = check_os_updates(&sections);
+
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(check.detail, "4 pending, 0 security; 5 more held back for full-upgrade (0 security)");
+    }
+
+    // A security fix that only a full-upgrade installs still needs attention, even though the
+    // weekly `apt upgrade` would leave it behind.
+    #[test]
+    fn a_held_back_security_update_still_needs_attention() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "0;0;3;1\n".to_string());
+
+        assert_eq!(check_os_updates(&sections).status, Status::Attention);
+    }
+
+    #[test]
+    fn a_failed_apt_simulation_is_unknown_not_clean() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "apt-get simulation failed\n".to_string());
+
+        assert_eq!(check_os_updates(&sections).status, Status::Unknown);
     }
 
     #[test]

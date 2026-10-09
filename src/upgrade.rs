@@ -1455,10 +1455,10 @@ async fn verify(
                 );
 
                 if is_settled(&findings) {
+                    // Printed on the capture that satisfies the run too: the last `quiet n/n`
+                    // line is the evidence that the window stayed quiet, not just started quiet.
                     let seen = run.quiet();
-                    if !run.satisfied(required_clean) && !expired {
-                        println!("  quiet {}/{}", seen, required_clean);
-                    }
+                    println!("  quiet {}/{}", seen, required_clean);
                 } else {
                     run.disturbed();
                 }

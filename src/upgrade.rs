@@ -45,8 +45,7 @@ pub struct UpgradeArgs {
     #[arg(
         long,
         env = "ROA_SSH_KEY",
-        help = "Private key for SSH. Falls back to ssh-agent and ~/.ssh/config when unset",
-        hide_env = true
+        help = "Private key for SSH. Falls back to ssh-agent and ~/.ssh/config when unset. Set ROA_SSH_KEY in ~/.config/roa/roa_variables to stop passing it"
     )]
     pub ssh_key: Option<String>,
 

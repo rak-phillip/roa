@@ -1936,6 +1936,7 @@ dependencies = [
  "dotenvy",
  "home",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_norway",

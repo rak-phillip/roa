@@ -57,6 +57,13 @@ ROA_AMI_ID=ami-0123456789abcdef0
 
 All variables can also be passed as CLI flags (flags take precedence over environment variables).
 
+The region is resolved by the AWS SDK's usual chain — `AWS_REGION`, then `AWS_DEFAULT_REGION`, then
+the active profile in `~/.aws/config` — falling back to `us-west-2`. `provision` records whichever
+region it actually resolved onto the manifest entry, and `maintain`, `upgrade` and `terminate` then
+target *that* region rather than the ambient config. An instance lives in exactly one region, so a
+shell pointed somewhere else does not change where its box is; setting the region per-command is
+how you provision into more than one.
+
 ## Usage
 
 ```
@@ -90,7 +97,7 @@ roa provision --name <NAME> --key-name <KEY_NAME> --email <EMAIL> [OPTIONS]
 | `--mode` | `helm` | Install method: `helm` (k3s + Helm) or `docker` |
 | `--storage-gb` | `64` | EBS root volume size in GB |
 | `--security-group-id` | *(auto-created)* | Use an existing security group instead of creating one |
-| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>-<minor>` |
+| `--rancher-repo` | `latest` | Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>.<minor>` |
 | `--rancher-version` | *(latest dev)* | Pin a specific Rancher version (e.g. `2.9.0`) |
 | `--k3s-version` | *(per Rancher minor, else latest stable)* | Pin the k3s version (`INSTALL_K3S_VERSION` form, e.g. `v1.36.2+k3s1`). Pass explicitly with `--rancher-repo alpha`/unpinned Rancher versions, where the default isn't resolved. |
 | `--rancher-hostname` | `<name>.ui.rancher.space` | Override the Rancher hostname |
@@ -135,7 +142,9 @@ roa provision --name long-lived --ssh-cidr 203.0.113.7/32 --ssm-profile my-ssm-p
 ```
 
 Pair it with `--ssm-profile` so there is a way back in when the address changes. roa never creates
-the IAM profile — it only attaches one that already exists — which keeps it out of IAM entirely.
+the IAM profile — it only attaches one that already exists — though attaching it still requires
+`iam:PassRole` on that role, and reaching the box needs `ssm:StartSession`. See
+[AWS permissions](#aws-permissions).
 With a profile attached at launch, the SSM agent Ubuntu already ships registers on first boot:
 
 ```bash
@@ -183,6 +192,43 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
 Use the bare form for a NodePort, never a `HOST:CONTAINER` pair. A NodePort has no way to learn that
 the host publishes it as some other port, so `8443:30443` would leave anything that reads the cluster
 to build a URL — a UI extension, a script — with no way to be right.
+
+### `versions` — List the Rancher charts a repo offers
+
+Lists a repo's `rancher` charts, newest published first, so you can choose a `--rancher-version`
+for `provision` or `upgrade`.
+
+```
+roa versions [--rancher-repo <REPO>] [--minor <MINOR>] [--head] [--limit <N> | --all]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rancher-repo` | `latest` | Repo to list. Takes the same values as `provision` |
+| `--minor` | *(all)* | Only list charts for this Rancher minor, e.g. `2.16` |
+| `--head` | `false` | Only list head charts |
+| `--limit` | `20` | Number of charts to list |
+| `--all` | `false` | List every matching chart |
+
+```bash
+roa versions --rancher-repo prime-latest --minor 2.16 --head --limit 3
+```
+
+```
+  PUBLISHED             VERSION              APP VERSION
+  2026-10-01 17:46 UTC  2.16.0-de13353-head  v2.16.0-de13353-head
+  2026-10-01 15:51 UTC  2.16.0-6620c97-head  v2.16.0-6620c97-head
+  2026-10-01 13:00 UTC  2.16.0-cc343bf-head  v2.16.0-cc343bf-head
+
+  showing 3 of 90; pass --all to list every one
+
+  An unpinned `roa provision` installs 2.16.0-ffbd1cc914559930ba6aaa03bc434ef32aefe490-head (published 2026-08-21).
+```
+
+The last line shows the chart you get when you leave `--rancher-version` off. `provision` then
+installs with `--devel`, so Helm takes the highest semver in the whole repo. Head versions are
+ranked by their commit SHA, so that chart can be weeks old and can belong to any minor in the repo.
+Pin a version from the list to get the build you want.
 
 ### `terminate` — Terminate a Rancher instance
 
@@ -296,6 +342,86 @@ Head charts are picked by **publish date**, never by semver — the pre-release 
 Rancher minors side by side and every head version is `<minor>.0-<sha>-head`, which semver ranks by
 an arbitrary hex string.
 
+### `upgrade` — Snapshot, bump the Rancher chart, verify
+
+Takes a restore point, upgrades the `rancher` Helm release, then verifies that nothing which was
+healthy before the upgrade is broken after it.
+
+```
+roa upgrade --name <NAME> (--latest-head | --rancher-version <VER>) [OPTIONS]
+```
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--name` | | | Instance name as recorded in the local manifest |
+| `--latest-head` | | | Upgrade to the newest head chart in the running minor |
+| `--rancher-version` | | | Upgrade to this exact chart version |
+| `--rancher-repo` | | *(the repo recorded on the instance)* | Chart repo to upgrade from |
+| `--ssh-user` | | `ubuntu` | SSH user on the instance |
+| `--ssh-key` | `ROA_SSH_KEY` | *(ssh-agent / `~/.ssh/config`)* | Private key for SSH |
+| `--dry-run` | | `false` | Select and report, but change nothing |
+| `--yes` | | `false` | Skip the confirmation prompt |
+| `--skip-snapshot` | | `false` | Do not take a pre-upgrade snapshot. Unsafe |
+| `--snapshot-timeout-minutes` | | `90` | How long to wait for the snapshot to complete |
+| `--helm-timeout` | | `20m` | Timeout passed to `helm upgrade` and `rollout status` |
+| `--settle-minutes` | | `10` | How long to let downstream agents re-register before failing |
+
+Exactly one of `--latest-head` or `--rancher-version` is required — for a command that restarts
+Rancher, the target is stated rather than defaulted.
+
+**There is no rollback.** `helm rollback` does not reverse datastore migrations Rancher's
+controllers may already have run, so the EBS snapshot is the only way back. On any failure the
+snapshot id, volume id and the restore sequence are printed locally.
+
+#### Verification is differential
+
+A shared box normally has things broken that are nobody's fault — other people's downstream
+clusters sitting disconnected, a ClusterRepo failing upstream. Verification therefore captures the
+box **before** the upgrade and compares, failing only on things that **regressed**:
+
+| | |
+|---|---|
+| Healthy before, unhealthy after | **fails** (tolerated while a cluster is re-registering, until the settle window expires) |
+| Unhealthy before and after | reported, never fatal — and if it broke *differently*, the change is shown |
+| Any Helm release left `pending-*` | **fails**, always — this is how a wedged pre-upgrade hook shows up, and it blocks the following week too |
+| Chart values changed across the upgrade | **fails** — a wiped values file yields a healthy Rancher on the wrong hostname |
+| Deployment registry host changed | **fails** |
+
+#### Before it touches anything
+
+Pre-flight refuses to start if a Helm release is not `deployed`, if the root disk is ≥85% full, or
+if the target chart is already running. On a `protected` instance the confirmation requires typing
+the instance name rather than `y`.
+
+**Example:**
+
+```bash
+roa upgrade --name shared --latest-head --dry-run
+```
+
+```
+shared (i-0123456789abcdef0) shared.ui.rancher.space [us-west-2]
+
+  from   rancher-2.16.0-2f60c05-head
+  to     2.16.0-ae20b74-head
+  published 2026-09-04 17:42 UTC
+  repo   https://charts.optimus.rancher.io/server-charts/latest
+  minor  2.16
+
+  dry run: re-reading the box to check the differ against a no-op
+
+  cluster/test-two         pre-existing  unhealthy before and after (Ready=Unknown Connected=False AgentDeployed=?)
+  clusterrepo/stgregistry  pre-existing  not downloading before or after (error 500: Internal Server Error)
+
+  no regressions across a no-op interval
+
+  nothing was changed
+```
+
+`--dry-run` reads the box twice and diffs the two captures. Nothing changed in between, so on a
+quiet box the result must contain no regressions — which is how the verification rules are checked
+against real data without touching anything.
+
 ## How it works
 
 1. **Provision** launches a `t3.2xlarge` EC2 instance with a user-data bootstrap script
@@ -352,20 +478,102 @@ No Plan is written when the k3s version is unpinned (`--rancher-repo alpha`/`--d
 `--k3s-version`), since there is no minor to pin to.
 
 Moving to a new minor is a deliberate act: bump `default_k3s_version` for the Rancher minor, and
-re-point or replace the Plan's channel. Upgrade Rancher itself separately via `helm upgrade` on the
-`rancher` release.
+re-point or replace the Plan's channel. Upgrade Rancher itself with `roa upgrade`, which snapshots
+first and verifies afterwards.
 
 ## AWS permissions
 
-The IAM principal running `roa` needs at minimum:
+`roa` calls EC2 and Route 53, and nothing else. `list` reads the local manifest only and needs no
+AWS access at all.
 
-- `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:TerminateInstances`
-- `ec2:CreateSecurityGroup`, `ec2:DeleteSecurityGroup`, `ec2:DescribeSecurityGroups`, `ec2:AuthorizeSecurityGroupIngress`
-- `route53:ChangeResourceRecordSets`, `route53:GetChange`
+`provision` needs:
 
-`maintain` additionally needs:
+- `ec2:RunInstances`, `ec2:DescribeInstances`
+- `ec2:CreateSecurityGroup`, `ec2:AuthorizeSecurityGroupIngress` — not needed if you always pass
+  `--security-group-id`
+- `ec2:CreateTags` — instances are tagged `Name` and `ManagedBy=roa` at launch, and tagging inside
+  the `RunInstances` call is authorized separately from the launch itself
+- `route53:ChangeResourceRecordSets` on the hosted zone, `route53:GetChange`
 
-- `ec2:DescribeSnapshots`
+`terminate` needs:
+
+- `ec2:DescribeInstances`, `ec2:TerminateInstances`
+- `ec2:DescribeSecurityGroups`, `ec2:DeleteSecurityGroup`
+- `route53:ChangeResourceRecordSets` on the hosted zone
+
+`maintain` needs:
+
+- `ec2:DescribeInstances`, `ec2:DescribeSnapshots`
+
+`upgrade` needs:
+
+- `ec2:DescribeInstances`, `ec2:DescribeSnapshots`, `ec2:CreateSnapshot`, `ec2:CreateTags`
+
+The Route 53 actions are worth scoping to the one zone you provision into. `GetChange` is not a
+resource-level call and has to stay on `change/*`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/<HOSTED_ZONE_ID>"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "route53:GetChange",
+      "Resource": "arn:aws:route53:::change/*"
+    }
+  ]
+}
+```
+
+### `--ssm-profile` needs `iam:PassRole`
+
+`roa` never creates an instance profile — it only attaches one that already exists — but attaching
+it still counts as passing that role to EC2. Without `iam:PassRole` the launch fails with
+`UnauthorizedOperation`, and because the profile is usually set once in `roa_variables` as
+`ROA_SSM_PROFILE`, the failure shows up on every `provision` rather than on an unusual flag. Scope
+the grant to the single role, and to EC2:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/<SSM_ROLE>",
+  "Condition": {
+    "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+  }
+}
+```
+
+### Reaching the instance over Session Manager
+
+This one is not a `roa` permission at all: `aws ssm start-session` is a call you make yourself, and
+the CLI never touches SSM. It is listed here because `--ssm-profile` is pointless without it.
+
+`ssm:StartSession` cannot be granted by ARN over instances that do not exist yet, but it can be
+granted on a resource tag — which is why every instance is born tagged `ManagedBy=roa`. One policy
+then covers every box `roa` will ever launch, instead of an edit per instance:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "ssm:StartSession",
+  "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/*",
+  "Condition": {
+    "StringEquals": { "ssm:resourceTag/ManagedBy": "roa" }
+  }
+}
+```
+
+Starting a session also needs `ssm:StartSession` on the session documents themselves
+(`SSM-SessionManagerRunShell`, and `AWS-StartPortForwardingSession` / `AWS-StartSSHSession` if you
+forward ports or tunnel ssh), since documents carry no tags to match on. `ssm:TerminateSession` and
+`ssm:ResumeSession` scope neatly to `session/${aws:username}-*`, and `ssm:DescribeInstanceInformation`
+has to be granted on `*`.
 
 ## Local state
 

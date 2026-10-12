@@ -6,6 +6,7 @@ use aws_sdk_ec2::types::{IamInstanceProfileSpecification, BlockDeviceMapping, Eb
 use clap::{Parser, ValueEnum};
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
+use crate::aws::DEFAULT_REGION;
 use crate::instance::{load_instances, manifest_path, save_instances, Instance};
 use crate::network::{create_security_group, get_public_ip, upsert_dns_record};
 
@@ -223,7 +224,7 @@ pub struct ProvisionArgs {
     #[arg(long, help = "Email address for Let's Encrypt certificate issuance")]
     email: String,
 
-    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or release-<major>-<minor>")]
+    #[arg(long, default_value = "latest", help = "Rancher Helm chart repo: `latest`, `prime`, `prime-latest` (Prime RC and head), `prime-alpha` (alias `alpha`), `community-alpha`, or `release-<major>.<minor>`")]
     rancher_repo: RancherRepo,
 
     #[arg(long, default_value_t = false, help = "Mark the instance protected so `terminate` refuses it without --force")]
@@ -316,9 +317,14 @@ fn k3s_minor_channel(k3s_version: &str) -> Option<String> {
 
 // Renders the shell that applies a system-upgrade-controller Plan tracking `channel`.
 // The channel is always minor-pinned; see the comment in `user-data` for why.
+//
+// The CRD is applied a few lines earlier in the same script, and an apply returns before the API
+// server has established it. Applying the Plan in that window fails with `no matches for kind
+// "Plan"`, and under `set -e` that ends the script before cert-manager and Rancher are installed.
 fn k3s_upgrade_plan(channel: &str) -> String {
     format!(
-        r#"kubectl apply -f - <<'PLANEOF'
+        r#"kubectl wait --for condition=established --timeout=120s crd/plans.upgrade.cattle.io
+kubectl apply -f - <<'PLANEOF'
 apiVersion: upgrade.cattle.io/v1
 kind: Plan
 metadata:
@@ -339,17 +345,24 @@ PLANEOF"#
 }
 
 pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let region = std::env::var("AWS_REGION")
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-west-2".to_string());
-
-    let region_provider = RegionProviderChain::default_provider()
-        .or_else(Region::new(region.clone()));
+    let region_provider =
+        RegionProviderChain::default_provider().or_else(Region::new(DEFAULT_REGION));
 
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
         .load()
         .await;
+
+    // Record the region the SDK actually resolved, never a second guess at it. Reading the
+    // manifest value straight from `AWS_REGION` while the client came from the full provider chain
+    // let the two disagree the moment the region was set in `~/.aws/config` rather than the
+    // environment: the instance launches in one region and the manifest claims another. That stays
+    // invisible for as long as the ambient config keeps matching, then strands the entry -- every
+    // later command looks the instance up by the region written here.
+    let region = config
+        .region()
+        .map(|region| region.to_string())
+        .ok_or("could not resolve an AWS region")?;
     let client = Client::new(&config);
     let r53 = aws_sdk_route53::Client::new(&config);
 
@@ -391,9 +404,14 @@ pub async fn provision(args: ProvisionArgs) -> Result<(), Box<dyn std::error::Er
         }
     };
 
+    let rancher_hostname = args.rancher_hostname.clone().unwrap_or_else(|| fqdn.clone());
+
     let user_data_script = render_sshd_hardening(&match args.mode {
         ProvisionMode::Helm => include_str!("../user-data")
-            .replace("\"<RANCHER_HOSTNAME>\"", &args.rancher_hostname.unwrap_or(fqdn.clone()))
+            // The quoted form carries its own quotes and loses them here; the bare form is for the
+            // places the hostname appears inside a larger string, such as the server-url patch.
+            .replace("\"<RANCHER_HOSTNAME>\"", &rancher_hostname)
+            .replace("<RANCHER_HOSTNAME>", &rancher_hostname)
             .replace("\"<LETS_ENCRYPT_EMAIL>\"", &args.email)
             .replace("\"<RANCHER_REPO>\"", rancher_repo)
             .replace("\"<RANCHER_VERSION>\"", &rancher_version)
@@ -632,6 +650,15 @@ mod tests {
         assert!(plan.contains("image: rancher/k3s-upgrade"));
     }
 
+    #[test]
+    fn the_plan_waits_for_its_crd_before_applying() {
+        let plan = k3s_upgrade_plan("v1.36");
+        let wait = plan.find("condition=established").expect("a CRD wait");
+        let apply = plan.find("kubectl apply").expect("a Plan apply");
+        assert!(wait < apply, "the Plan is applied before its CRD is established");
+        assert!(plan.contains("crd/plans.upgrade.cattle.io"));
+    }
+
     fn mapping(spec: &str) -> PortMapping {
         parse_port_mapping(spec).expect("a port mapping")
     }
@@ -789,6 +816,23 @@ mod tests {
         let without_plan = template.replace("\"<K3S_UPGRADE_PLAN>\"", "");
         assert!(!without_plan.contains("kind: Plan"));
         assert!(!without_plan.contains("<K3S_UPGRADE_PLAN>"));
+    }
+
+    // An empty `server-url` blocks Rancher's cluster-deploy handler, so a downstream imported
+    // before anyone has logged into the UI never leaves `Ready=False`. The hostname appears here
+    // inside a JSON patch rather than as its own quoted token, so it needs the bare substitution --
+    // the quoted-only replace this test guards against would leave the placeholder on the box.
+    #[test]
+    fn rendering_user_data_sets_server_url_to_the_real_hostname() {
+        let hostname = "prak-upgrade-ds.ui.rancher.space";
+
+        let rendered = include_str!("../user-data")
+            .replace("\"<RANCHER_HOSTNAME>\"", hostname)
+            .replace("<RANCHER_HOSTNAME>", hostname);
+
+        assert!(rendered.contains("setting.management.cattle.io server-url"));
+        assert!(rendered.contains(&format!(r#"{{"value":"https://{}"}}"#, hostname)));
+        assert!(!rendered.contains("<RANCHER_HOSTNAME>"));
     }
 
     #[test]

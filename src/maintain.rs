@@ -1,17 +1,15 @@
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::time::Duration;
 
-use aws_config::meta::region::RegionProviderChain;
-use aws_config::{BehaviorVersion, Region};
-use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ec2::types::Filter;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use crate::aws::{ec2_client, root_volume_id};
 use crate::instance::{Instance, load_instances, manifest_path};
 use crate::provision::RancherRepo;
+use crate::ssh::{SshTarget, run_script, split_sections};
 
 const K3S_CHANNELS_URL: &str = "https://update.k3s.io/v1-release/channels";
 const SNAPSHOT_MAX_AGE_DAYS: i64 = 7;
@@ -28,8 +26,7 @@ pub struct MaintainArgs {
     #[arg(
         long,
         env = "ROA_SSH_KEY",
-        help = "Private key for SSH. Falls back to ssh-agent and ~/.ssh/config when unset",
-        hide_env = true
+        help = "Private key for SSH. Falls back to ssh-agent and ~/.ssh/config when unset. Set ROA_SSH_KEY in ~/.config/roa/roa_variables to stop passing it"
     )]
     ssh_key: Option<String>,
 
@@ -192,14 +189,17 @@ pub async fn maintain(args: MaintainArgs) -> Result<(), Box<dyn std::error::Erro
 const REMOTE_SCRIPT: &str = r#"
 export KUBECONFIG=${KUBECONFIG:-$HOME/.kube/config}
 echo '###apt'
-if [ -x /usr/lib/update-notifier/apt-check ]; then
-  # Writes `total;security` to stderr with no trailing newline.
-  /usr/lib/update-notifier/apt-check 2>&1
-  echo
+# `upgrade;upgrade-security;full-upgrade;full-upgrade-security`, from apt-get's own simulation.
+# apt-check counts what a full-upgrade would install, so a kernel kept back for new dependencies
+# made the report say 9 pending while `apt upgrade` installed 4 (2026-10-02). Both counts honour
+# phasing, so a phased package appears in neither.
+if up=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null) \
+   && full=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null); then
+  up=$(printf '%s\n' "$up" | grep '^Inst ' || true)
+  full=$(printf '%s\n' "$full" | grep '^Inst ' || true)
+  echo "$(printf '%s' "$up" | grep -c . || true);$(printf '%s' "$up" | grep -c -- '-security' || true);$(printf '%s' "$full" | grep -c . || true);$(printf '%s' "$full" | grep -c -- '-security' || true)"
 else
-  total=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c . || true)
-  security=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -c -- '-security' || true)
-  echo "${total};${security}"
+  echo 'apt-get simulation failed'
 fi
 echo '###reboot'
 if [ -f /var/run/reboot-required ]; then
@@ -227,75 +227,28 @@ echo '###end'
 "#;
 
 fn run_remote(instance: &Instance, args: &MaintainArgs) -> Result<String, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("ssh");
+    let target = SshTarget {
+        user: &args.ssh_user,
+        host: &instance.fqdn,
+        key: args.ssh_key.as_deref(),
+        // The report is one short batch; nothing here runs long enough to be reaped.
+        keepalive: false,
+    };
 
-    // Never block on a prompt: this is meant to be scriptable.
-    cmd.arg("-o").arg("BatchMode=yes")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new");
-
-    if let Some(key) = &args.ssh_key {
-        cmd.arg("-i").arg(key);
-    }
-
-    // The FQDN, not the manifest's public_ip -- the instance has no Elastic IP, so the
-    // recorded address goes stale across a stop/start while DNS stays authoritative.
-    cmd.arg(format!("{}@{}", args.ssh_user, instance.fqdn))
-        .arg("bash -s")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    {
-        use std::io::Write;
-        let stdin = child.stdin.as_mut().ok_or("failed to open ssh stdin")?;
-        stdin.write_all(REMOTE_SCRIPT.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let output = run_script(&target, REMOTE_SCRIPT)?;
 
     // The remote script only exits non-zero if ssh itself failed to connect; per-check
     // failures are already swallowed above.
-    if !output.status.success() && !stdout.contains("###end") {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
+    if !output.success && !output.stdout.contains("###end") {
+        return Err(if output.stderr.is_empty() {
             format!("ssh exited with {}", output.status)
         } else {
-            stderr
+            output.stderr
         }
         .into());
     }
 
-    Ok(stdout)
-}
-
-fn split_sections(output: &str) -> BTreeMap<String, String> {
-    let mut sections = BTreeMap::new();
-    let mut current: Option<String> = None;
-    let mut buffer = String::new();
-
-    for line in output.lines() {
-        if let Some(name) = line.strip_prefix("###") {
-            if let Some(key) = current.take() {
-                sections.insert(key, std::mem::take(&mut buffer));
-            }
-            if name != "end" {
-                current = Some(name.to_string());
-            }
-        } else if current.is_some() {
-            buffer.push_str(line);
-            buffer.push('\n');
-        }
-    }
-
-    if let Some(key) = current {
-        sections.insert(key, buffer);
-    }
-
-    sections
+    Ok(output.stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,21 +260,30 @@ fn check_os_updates(sections: &BTreeMap<String, String>) -> Check {
         return Check::unknown("os-updates", "not collected");
     };
 
-    // apt-check writes `total;security` to stderr, which the script folds into stdout.
-    let line = raw.lines().find(|l| l.contains(';')).unwrap_or("").trim();
-    let mut parts = line.split(';');
+    let line = raw.lines().find(|l| l.contains(';')).unwrap_or(raw.trim()).trim();
+    let counts: Vec<u32> = line.split(';').filter_map(|p| p.trim().parse().ok()).collect();
 
-    match (parts.next().and_then(|p| p.trim().parse::<u32>().ok()),
-           parts.next().and_then(|p| p.trim().parse::<u32>().ok())) {
-        (Some(total), Some(security)) => {
-            let detail = format!("{} pending, {} security", total, security);
-            if security > 0 {
-                Check::attention("os-updates", detail)
-            } else {
-                Check::ok("os-updates", detail)
-            }
-        }
-        _ => Check::unknown("os-updates", format!("unparsed apt output: {}", line)),
+    let [upgrade, security, full, full_security] = counts[..] else {
+        return Check::unknown("os-updates", format!("unparsed apt output: {}", line));
+    };
+
+    // What `apt upgrade` will do comes first, because that is what the window runs. Anything only
+    // a full-upgrade installs -- usually a new kernel's meta packages -- is reported separately so
+    // the two counts never get compared against each other again.
+    let mut detail = format!("{} pending, {} security", upgrade, security);
+    let held = full.saturating_sub(upgrade);
+    if held > 0 {
+        detail.push_str(&format!(
+            "; {} more held back for full-upgrade ({} security)",
+            held,
+            full_security.saturating_sub(security)
+        ));
+    }
+
+    if full_security > 0 {
+        Check::attention("os-updates", detail)
+    } else {
+        Check::ok("os-updates", detail)
     }
 }
 
@@ -505,6 +467,25 @@ pub struct ChartEntry {
     pub created: DateTime<Utc>,
 }
 
+pub async fn fetch_index(repo_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}/index.yaml", repo_url.trim_end_matches('/'));
+    let body = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(body)
+}
+
+// Every `rancher` chart in the index, in the index's own order.
+pub fn rancher_charts(index: &str) -> Result<Vec<ChartEntry>, Box<dyn std::error::Error>> {
+    let mut index: ChartIndex = serde_norway::from_str(index)?;
+    Ok(index.entries.remove("rancher").unwrap_or_default())
+}
+
 // Newest `<minor>.*-head` chart in the index, chosen by publish date.
 //
 // NEVER pick by semver. This repo carries 2.14, 2.15 and 2.16 pre-release charts side by side
@@ -526,13 +507,31 @@ pub fn newest_head_chart(index: &str, minor: &str) -> Result<Option<ChartEntry>,
         .cloned())
 }
 
+// Publish date of one exact chart version, or None when the index does not carry it.
+//
+// Head versions cannot be ordered by semver (see `newest_head_chart`), so comparing two charts'
+// ages is only possible through the index. A version the index has never heard of is `None` rather
+// than an error: a pinned chart from a repo that has since dropped it is unusual, not invalid.
+pub fn chart_published(
+    index: &str,
+    version: &str,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    let index: ChartIndex = serde_norway::from_str(index)?;
+
+    let Some(entries) = index.entries.get("rancher") else {
+        return Ok(None);
+    };
+
+    Ok(entries.iter().find(|e| e.version == version).map(|e| e.created))
+}
+
 // `rancher-2.16.0-<sha>-head` -> `2.16`, and `rancher-2.16-<sha>-head` -> `2.16`.
 //
 // The minor is truncated at the first non-digit because the pre-release repos publish both
 // shapes: most head charts are `<major>.<minor>.<patch>-<sha>-head`, but some carry no patch
 // component at all and the SHA runs straight into the minor. Splitting on `.` alone hands back
 // the whole SHA-bearing string, which then matches no chart in the index.
-fn chart_minor(chart: &str) -> Option<String> {
+pub fn chart_minor(chart: &str) -> Option<String> {
     let version = chart.strip_prefix("rancher-")?;
     let mut parts = version.split('.');
 
@@ -751,37 +750,9 @@ async fn newest_snapshot(
 ) -> Result<Option<(String, DateTime<Utc>, String)>, Box<dyn std::error::Error>> {
     // Seed the region from the manifest so the report always targets the instance's region
     // rather than whatever the ambient AWS config happens to say.
-    let region_provider =
-        RegionProviderChain::default_provider().or_else(Region::new(instance.region.clone()));
+    let ec2 = ec2_client(&instance.region).await;
 
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-
-    let ec2 = Ec2Client::new(&config);
-
-    let described = ec2
-        .describe_instances()
-        .instance_ids(&instance.instance_id)
-        .send()
-        .await?;
-
-    let root_device = described
-        .reservations()
-        .first()
-        .and_then(|r| r.instances().first())
-        .ok_or_else(|| format!("instance {} not found", instance.instance_id))?;
-
-    let root_name = root_device.root_device_name().unwrap_or("/dev/sda1");
-
-    let volume_id = root_device
-        .block_device_mappings()
-        .iter()
-        .find(|m| m.device_name() == Some(root_name))
-        .and_then(|m| m.ebs())
-        .and_then(|e| e.volume_id())
-        .ok_or("could not resolve the root volume")?;
+    let volume_id = root_volume_id(&ec2, &instance.instance_id).await?;
 
     let snapshots = ec2
         .describe_snapshots()
@@ -937,26 +908,45 @@ entries:
     }
 
     #[test]
-    fn splits_the_batched_remote_output_into_sections() {
-        let output = "###apt\n191;137\n###reboot\nnone\n###k3s_version\nv1.36.3+k3s1\n\n###end\n";
-        let sections = split_sections(output);
-
-        assert_eq!(sections.get("apt").unwrap().trim(), "191;137");
-        assert_eq!(sections.get("reboot").unwrap().trim(), "none");
-        assert_eq!(sections.get("k3s_version").unwrap().trim(), "v1.36.3+k3s1");
-        assert!(!sections.contains_key("end"));
-    }
-
-    #[test]
     fn flags_pending_security_updates() {
         let mut sections = BTreeMap::new();
-        sections.insert("apt".to_string(), "191;137\n".to_string());
+        sections.insert("apt".to_string(), "191;137;191;137\n".to_string());
         let check = check_os_updates(&sections);
         assert_eq!(check.status, Status::Attention);
         assert!(check.detail.contains("137 security"));
 
-        sections.insert("apt".to_string(), "3;0\n".to_string());
+        sections.insert("apt".to_string(), "3;0;3;0\n".to_string());
         assert_eq!(check_os_updates(&sections).status, Status::Ok);
+    }
+
+    // 2026-10-02: the report said 9 pending, `apt upgrade` installed 4, and the other 5 were a
+    // kernel kept back for new dependencies. The detail has to say which is which.
+    #[test]
+    fn separates_what_upgrade_installs_from_what_full_upgrade_would() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "4;0;9;0\n".to_string());
+        let check = check_os_updates(&sections);
+
+        assert_eq!(check.status, Status::Ok);
+        assert_eq!(check.detail, "4 pending, 0 security; 5 more held back for full-upgrade (0 security)");
+    }
+
+    // A security fix that only a full-upgrade installs still needs attention, even though the
+    // weekly `apt upgrade` would leave it behind.
+    #[test]
+    fn a_held_back_security_update_still_needs_attention() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "0;0;3;1\n".to_string());
+
+        assert_eq!(check_os_updates(&sections).status, Status::Attention);
+    }
+
+    #[test]
+    fn a_failed_apt_simulation_is_unknown_not_clean() {
+        let mut sections = BTreeMap::new();
+        sections.insert("apt".to_string(), "apt-get simulation failed\n".to_string());
+
+        assert_eq!(check_os_updates(&sections).status, Status::Unknown);
     }
 
     #[test]

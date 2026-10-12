@@ -1,15 +1,21 @@
+mod aws;
 mod maintain;
 mod provision;
 mod terminate;
 mod network;
 mod list;
 mod instance;
+mod ssh;
+mod upgrade;
+mod versions;
 
 use clap::{Parser, Subcommand};
 use crate::list::{list, ListArgs};
 use crate::maintain::{maintain, MaintainArgs};
 use crate::provision::{provision, ProvisionArgs};
 use crate::terminate::{terminate, TerminateArgs};
+use crate::upgrade::{upgrade, UpgradeArgs};
+use crate::versions::{versions, VersionsArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "roa", about = "Rancher on AWS", long_about = None)]
@@ -28,6 +34,10 @@ pub enum Commands{
     List(ListArgs),
     #[clap(about = "Reports on an instance's OS, k3s, Rancher chart and snapshot state. Exits non-zero when something needs attention")]
     Maintain(MaintainArgs),
+    #[clap(about = "Snapshots the instance and upgrades the Rancher chart, then verifies nothing that was healthy regressed")]
+    Upgrade(UpgradeArgs),
+    #[clap(about = "Lists the Rancher charts a repo offers, newest published first")]
+    Versions(VersionsArgs),
 }
 
 #[tokio::main]
@@ -52,6 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Maintain(args) => {
             maintain(args).await?;
+        },
+        Commands::Upgrade(args) => {
+            upgrade(args).await?;
+        },
+        Commands::Versions(args) => {
+            versions(args).await?;
         }
     }
 
